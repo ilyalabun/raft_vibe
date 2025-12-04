@@ -57,9 +57,28 @@ fn main() {
     // Leader receives a client command
     println!("Leader (Node 1) receives client command: SET x=42");
     let entry = node1.append_log_entry("SET x=42".to_string());
-    println!("  Added log entry: term={}, index={}, command={}", 
-             entry.term, entry.index, entry.command);
+    let entry = match entry {
+        Some(e) => {
+            println!("  Added log entry: term={}, index={}, command={}", 
+                    e.term, e.index, e.command);
+            e
+        }
+        None => {
+            println!("  ERROR: Not a leader, cannot append entry!");
+            return;
+        }
+    };
     println!();
+
+    // Follower tries to receive a client command (should be rejected)
+    println!("Follower (Node 2) receives client command: SET x=43");
+    let follower_entry = node2.append_log_entry("SET x=43".to_string());
+    match follower_entry {
+        Some(e) => println!("  Added log entry: term={}, index={}, command={}", 
+                           e.term, e.index, e.command),
+        None => println!("  REJECTED: Followers cannot accept client commands!"),
+    }
+    println!();    
 
     // Leader replicates log to followers
     println!("Leader replicates log to followers...");

@@ -293,7 +293,13 @@ impl RaftNode {
     }
 
     /// Add a new log entry (called by leader when receiving client request)
-    pub fn append_log_entry(&mut self, command: String) -> LogEntry {
+    /// Returns None if called on a non-leader node
+    pub fn append_log_entry(&mut self, command: String) -> Option<LogEntry> {
+        // Only leaders can append log entries
+        if self.state != RaftState::Leader {
+            return None;
+        }
+        
         let index = self.last_log_index() + 1;
         let entry = LogEntry {
             term: self.current_term,
@@ -301,7 +307,7 @@ impl RaftNode {
             command,
         };
         self.log.push(entry.clone());
-        entry
+        Some(entry)
     }
 
     /// Apply committed entries to the state machine
