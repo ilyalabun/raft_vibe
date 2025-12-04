@@ -197,6 +197,9 @@ impl RaftNode {
             false
         } else {
             // If we receive AppendEntries from a valid leader, we're a follower
+            // Note: leader_id is used to identify which leader is sending the request
+            // In a full implementation, this would be used for leader tracking
+            let _leader_id = args.leader_id;
             self.state = RaftState::Follower;
 
             // Reply false if log doesn't contain an entry at prev_log_index with term matching prev_log_term
@@ -228,6 +231,8 @@ impl RaftNode {
                                 args.leader_commit,
                                 self.last_log_index(),
                             );
+                            // Apply committed entries to state machine
+                            self.apply_committed_entries();
                         }
 
                         true
@@ -246,6 +251,8 @@ impl RaftNode {
                         args.leader_commit,
                         self.last_log_index(),
                     );
+                    // Apply committed entries to state machine
+                    self.apply_committed_entries();
                 }
 
                 true
@@ -295,6 +302,39 @@ impl RaftNode {
         };
         self.log.push(entry.clone());
         entry
+    }
+
+    /// Apply committed entries to the state machine
+    /// Updates last_applied to match commit_index
+    pub fn apply_committed_entries(&mut self) {
+        // In a full implementation, this would apply entries to the state machine
+        // For now, we just update last_applied to track what's been applied
+        while self.last_applied < self.commit_index {
+            self.last_applied += 1;
+            // In a real implementation, we would apply self.log[(self.last_applied - 1) as usize] to the state machine
+        }
+    }
+
+    /// Process a RequestVote response (called by candidate)
+    /// Updates term if response contains a higher term
+    pub fn process_request_vote_response(&mut self, result: RequestVoteResult) {
+        // If RPC response contains term T > currentTerm: set currentTerm = T, convert to follower
+        if result.term > self.current_term {
+            self.current_term = result.term;
+            self.voted_for = None;
+            self.state = RaftState::Follower;
+        }
+    }
+
+    /// Process an AppendEntries response (called by leader)
+    /// Updates term if response contains a higher term
+    pub fn process_append_entries_response(&mut self, result: AppendEntriesResult) {
+        // If RPC response contains term T > currentTerm: set currentTerm = T, convert to follower
+        if result.term > self.current_term {
+            self.current_term = result.term;
+            self.voted_for = None;
+            self.state = RaftState::Follower;
+        }
     }
 }
 

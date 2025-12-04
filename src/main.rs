@@ -42,6 +42,10 @@ fn main() {
     println!("  Node 2 vote: {}", if vote_result_2.vote_granted { "GRANTED" } else { "DENIED" });
     println!("  Node 3 vote: {}", if vote_result_3.vote_granted { "GRANTED" } else { "DENIED" });
 
+    // Process responses to update term if needed
+    node1.process_request_vote_response(vote_result_2.clone());
+    node1.process_request_vote_response(vote_result_3.clone());
+
     // Node 1 received 2 votes (itself + one other) = majority in 3-node cluster
     if vote_result_2.vote_granted || vote_result_3.vote_granted {
         println!("\nNode 1 received majority of votes!");
@@ -85,6 +89,45 @@ fn main() {
     let append_result_3 = node3.handle_append_entries(append_args_3);
     println!("  Node 3 replication: {}", if append_result_3.success { "SUCCESS" } else { "FAILED" });
     println!("  Node 3 log length: {}", node3.log.len());
+
+    // Process responses to update term if needed
+    node1.process_append_entries_response(append_result_2.clone());
+    node1.process_append_entries_response(append_result_3.clone());
+
+    // If entry is replicated to majority, commit it
+    let mut replicated_count = 1; // Leader has it
+    if append_result_2.success {
+        replicated_count += 1;
+    }
+    if append_result_3.success {
+        replicated_count += 1;
+    }
+    
+    if replicated_count > 1 { // Majority in 3-node cluster
+        node1.commit_index = entry.index;
+        node1.apply_committed_entries();
+        println!("\nEntry committed (replicated to {} nodes)", replicated_count);
+        
+        // Send updated commit_index to followers via AppendEntries (heartbeat)
+        let heartbeat_2 = AppendEntriesArgs {
+            term: node1.current_term,
+            leader_id: node1.id,
+            prev_log_index: node2.last_log_index(),
+            prev_log_term: node2.last_log_term(),
+            entries: vec![],
+            leader_commit: node1.commit_index,
+        };
+        let heartbeat_3 = AppendEntriesArgs {
+            term: node1.current_term,
+            leader_id: node1.id,
+            prev_log_index: node3.last_log_index(),
+            prev_log_term: node3.last_log_term(),
+            entries: vec![],
+            leader_commit: node1.commit_index,
+        };
+        node2.handle_append_entries(heartbeat_2);
+        node3.handle_append_entries(heartbeat_3);
+    }
     println!();
 
     // Show final state
@@ -94,16 +137,19 @@ fn main() {
     println!("  Term: {}", node1.current_term);
     println!("  Log entries: {}", node1.log.len());
     println!("  Commit index: {}", node1.commit_index);
+    println!("  Last applied: {}", node1.last_applied);
     
     println!("\nNode 2 (Follower):");
     println!("  State: {:?}", node2.state);
     println!("  Term: {}", node2.current_term);
     println!("  Log entries: {}", node2.log.len());
+    println!("  Last applied: {}", node2.last_applied);
     
     println!("\nNode 3 (Follower):");
     println!("  State: {:?}", node3.state);
     println!("  Term: {}", node3.current_term);
     println!("  Log entries: {}", node3.log.len());
+    println!("  Last applied: {}", node3.last_applied);
 
     println!("\n=== Demo Complete! ===");
     println!("\nNext steps:");
