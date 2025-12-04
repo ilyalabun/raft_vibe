@@ -155,7 +155,7 @@ impl RaftNode {
 
     /// Handle RequestVote RPC
     /// Returns (term, vote_granted)
-    pub fn handle_request_vote(&mut self, args: RequestVoteArgs) -> RequestVoteResult {
+    pub fn handle_request_vote(&mut self, args: &RequestVoteArgs) -> RequestVoteResult {
         // If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
         if args.term > self.current_term {
             self.current_term = args.term;
@@ -184,7 +184,7 @@ impl RaftNode {
     }
 
     /// Handle AppendEntries RPC (heartbeat or log replication)
-    pub fn handle_append_entries(&mut self, args: AppendEntriesArgs) -> AppendEntriesResult {
+    pub fn handle_append_entries(&mut self, args: &AppendEntriesArgs) -> AppendEntriesResult {
         // If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
         if args.term > self.current_term {
             self.current_term = args.term;
@@ -221,8 +221,8 @@ impl RaftNode {
                         }
 
                         // Append any new entries not already in the log
-                        for entry in args.entries {
-                            self.log.push(entry);
+                        for entry in &args.entries {
+                            self.log.push(entry.clone());
                         }
 
                         // If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
@@ -241,8 +241,8 @@ impl RaftNode {
             } else {
                 // prev_log_index is 0, meaning we're starting from the beginning
                 // Append any new entries
-                for entry in args.entries {
-                    self.log.push(entry);
+                for entry in &args.entries {
+                    self.log.push(entry.clone());
                 }
 
                 // Update commit_index
@@ -317,7 +317,7 @@ impl RaftNode {
 
     /// Process a RequestVote response (called by candidate)
     /// Updates term if response contains a higher term
-    pub fn process_request_vote_response(&mut self, result: RequestVoteResult) {
+    pub fn process_request_vote_response(&mut self, result: &RequestVoteResult) {
         // If RPC response contains term T > currentTerm: set currentTerm = T, convert to follower
         if result.term > self.current_term {
             self.current_term = result.term;
@@ -328,7 +328,7 @@ impl RaftNode {
 
     /// Process an AppendEntries response (called by leader)
     /// Updates term if response contains a higher term
-    pub fn process_append_entries_response(&mut self, result: AppendEntriesResult) {
+    pub fn process_append_entries_response(&mut self, result: &AppendEntriesResult) {
         // If RPC response contains term T > currentTerm: set currentTerm = T, convert to follower
         if result.term > self.current_term {
             self.current_term = result.term;

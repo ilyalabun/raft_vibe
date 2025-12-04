@@ -58,6 +58,12 @@ Added all the prompts used during the session to the log, showing the natural fl
 
 Encountered compiler warnings about unused fields in the Raft implementation. Instead of suppressing them with `#[allow(dead_code)]`, implemented proper usage of all fields according to the Raft protocol. Added methods to process RPC responses that check and update terms (`process_request_vote_response` and `process_append_entries_response`), implemented `apply_committed_entries` to update `last_applied` when entries are committed, and enhanced the demo to show the complete Raft flow including committing entries and applying them to the state machine. The code now compiles without warnings and demonstrates a more complete Raft implementation.
 
+**Prompt:** "why do we need `vote_args.clone()` and such?" and "can we do clone automatically?" and "can we avoid doing clone() during iteration somehow?"
+
+**Optimizing Ownership with References**
+
+Learned about Rust's ownership system and how to avoid unnecessary cloning. Changed all RPC handler functions to accept references (`&RequestVoteArgs`, `&AppendEntriesArgs`, etc.) instead of taking ownership, eliminating the need for `.clone()` calls when passing arguments to multiple nodes. For iterating over entries, used `for entry in &args.entries { self.log.push(entry.clone()); }` to borrow the vector and only clone individual entries when needed, rather than cloning the entire vector upfront. This approach is more efficient and demonstrates proper Rust ownership patterns.
+
 ---
 
 ## Notes

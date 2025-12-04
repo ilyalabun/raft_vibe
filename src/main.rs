@@ -36,15 +36,15 @@ fn main() {
         last_log_term: node1.last_log_term(),
     };
 
-    let vote_result_2 = node2.handle_request_vote(vote_args.clone());
-    let vote_result_3 = node3.handle_request_vote(vote_args.clone());
+    let vote_result_2 = node2.handle_request_vote(&vote_args);
+    let vote_result_3 = node3.handle_request_vote(&vote_args);
 
     println!("  Node 2 vote: {}", if vote_result_2.vote_granted { "GRANTED" } else { "DENIED" });
     println!("  Node 3 vote: {}", if vote_result_3.vote_granted { "GRANTED" } else { "DENIED" });
 
     // Process responses to update term if needed
-    node1.process_request_vote_response(vote_result_2.clone());
-    node1.process_request_vote_response(vote_result_3.clone());
+    node1.process_request_vote_response(&vote_result_2);
+    node1.process_request_vote_response(&vote_result_3);
 
     // Node 1 received 2 votes (itself + one other) = majority in 3-node cluster
     if vote_result_2.vote_granted || vote_result_3.vote_granted {
@@ -73,7 +73,7 @@ fn main() {
         entries: vec![entry.clone()],
         leader_commit: node1.commit_index,
     };
-    let append_result_2 = node2.handle_append_entries(append_args_2);
+    let append_result_2 = node2.handle_append_entries(&append_args_2);
     println!("  Node 2 replication: {}", if append_result_2.success { "SUCCESS" } else { "FAILED" });
     println!("  Node 2 log length: {}", node2.log.len());
 
@@ -86,13 +86,13 @@ fn main() {
         entries: vec![entry.clone()],
         leader_commit: node1.commit_index,
     };
-    let append_result_3 = node3.handle_append_entries(append_args_3);
+    let append_result_3 = node3.handle_append_entries(&append_args_3);
     println!("  Node 3 replication: {}", if append_result_3.success { "SUCCESS" } else { "FAILED" });
     println!("  Node 3 log length: {}", node3.log.len());
 
     // Process responses to update term if needed
-    node1.process_append_entries_response(append_result_2.clone());
-    node1.process_append_entries_response(append_result_3.clone());
+    node1.process_append_entries_response(&append_result_2);
+    node1.process_append_entries_response(&append_result_3);
 
     // If entry is replicated to majority, commit it
     let mut replicated_count = 1; // Leader has it
@@ -125,8 +125,8 @@ fn main() {
             entries: vec![],
             leader_commit: node1.commit_index,
         };
-        node2.handle_append_entries(heartbeat_2);
-        node3.handle_append_entries(heartbeat_3);
+        node2.handle_append_entries(&heartbeat_2);
+        node3.handle_append_entries(&heartbeat_3);
     }
     println!();
 
