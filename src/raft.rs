@@ -104,6 +104,8 @@ pub struct RaftNode {
     pub state: RaftState,
     /// IDs of other nodes in the cluster
     pub peers: Vec<u64>,
+    /// Peers that have granted votes in the current election (used by candidates)
+    votes_received: Vec<u64>,
 }
 
 impl RaftNode {
@@ -120,6 +122,7 @@ impl RaftNode {
             id,
             state: RaftState::Follower,
             peers,
+            votes_received: Vec::new(),
         }
     }
 
@@ -145,90 +148,105 @@ impl RaftNode {
     /// Returns true if:
     /// - candidate's last log term > receiver's last log term, OR
     /// - candidate's last log term == receiver's last log term AND candidate's last log index >= receiver's last log index
-    pub fn is_log_up_to_date(&self, last_log_term: u64, last_log_index: u64) -> bool {
+    pub fn is_log_up_to_date(&self, candidate_last_log_term: u64, candidate_last_log_index: u64) -> bool {
         let my_last_term = self.last_log_term();
         let my_last_index = self.last_log_index();
 
-        last_log_term > my_last_term || 
-        (last_log_term == my_last_term && last_log_index >= my_last_index)
+        candidate_last_log_term > my_last_term || 
+        (candidate_last_log_term == my_last_term && candidate_last_log_index >= my_last_index)
     }
 
     /// Handle RequestVote RPC
     /// Returns (term, vote_granted)
-    pub fn handle_request_vote(&mut self, args: &RequestVoteArgs) -> RequestVoteResult {
+    pub fn handle_request_vote(&mut self, vote_req: &RequestVoteArgs) -> RequestVoteResult {
+        
+        // Decline requests with stale term immediately
+        if vote_req.term < self.current_term {
+            return RequestVoteResult {
+                term: self.current_term,
+                vote_granted: false,
+            };
+        }
+
         // If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
-        if args.term > self.current_term {
-            self.current_term = args.term;
+        if vote_req.term > self.current_term {
+            self.current_term = vote_req.term;
             self.voted_for = None;
             self.state = RaftState::Follower;
         }
 
-        let vote_granted = if args.term < self.current_term {
-            // Reply false if term < currentTerm
-            false
-        } else if self.voted_for.is_some() && self.voted_for != Some(args.candidate_id) {
-            // If votedFor is null or candidateId, and candidate's log is at least as up-to-date as receiver's log, grant vote
-            false
-        } else if !self.is_log_up_to_date(args.last_log_term, args.last_log_index) {
-            false
-        } else {
-            // Grant vote
-            self.voted_for = Some(args.candidate_id);
-            true
-        };
+        // If already voted for another candidate, decline vote
+        if self.voted_for.is_some() && self.voted_for != Some(vote_req.candidate_id) {
+            return RequestVoteResult {
+                term: self.current_term,
+                vote_granted: false,
+            };
+        }
+
+        if !self.is_log_up_to_date(vote_req.last_log_term, vote_req.last_log_index) {
+            return RequestVoteResult {
+                term: self.current_term,
+                vote_granted: false,
+            };
+        }
+
+        // Grant vote
+        self.voted_for = Some(vote_req.candidate_id);
 
         RequestVoteResult {
             term: self.current_term,
-            vote_granted,
+            vote_granted: true,
         }
     }
 
     /// Handle AppendEntries RPC (heartbeat or log replication)
-    pub fn handle_append_entries(&mut self, args: &AppendEntriesArgs) -> AppendEntriesResult {
+    pub fn handle_append_entries(&mut self, append_req: &AppendEntriesArgs) -> AppendEntriesResult {
         // If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
-        if args.term > self.current_term {
-            self.current_term = args.term;
+        if append_req.term > self.current_term {
+            self.current_term = append_req.term;
             self.voted_for = None;
             self.state = RaftState::Follower;
         }
 
-        let success = if args.term < self.current_term {
+        let success = if append_req.term < self.current_term {
             // Reply false if term < currentTerm
             false
         } else {
             // If we receive AppendEntries from a valid leader, we're a follower
             // Note: leader_id is used to identify which leader is sending the request
             // In a full implementation, this would be used for leader tracking
-            let _leader_id = args.leader_id;
+            let _leader_id = append_req.leader_id;
             self.state = RaftState::Follower;
 
             // Reply false if log doesn't contain an entry at prev_log_index with term matching prev_log_term
-            if args.prev_log_index > 0 {
-                if args.prev_log_index > self.last_log_index() as u64 {
+            if append_req.prev_log_index > 0 {
+
+                // If current log is not up-to-date, return false
+                if append_req.prev_log_index > self.last_log_index() {
                     false
                 } else {
                     // Check if the entry at prev_log_index has the correct term
                     // Note: log is 0-indexed, but prev_log_index is 1-indexed
-                    let log_index = (args.prev_log_index - 1) as usize;
-                    if log_index >= self.log.len() || self.log[log_index].term != args.prev_log_term {
+                    let log_index = (append_req.prev_log_index - 1) as usize;
+                    if log_index >= self.log.len() || self.log[log_index].term != append_req.prev_log_term {
                         false
                     } else {
                         // If an existing entry conflicts with a new one (same index but different terms),
                         // delete the existing entry and all that follow it
-                        let conflict_index = args.prev_log_index as usize;
+                        let conflict_index = append_req.prev_log_index as usize;
                         if conflict_index < self.log.len() {
                             self.log.truncate(conflict_index);
                         }
 
                         // Append any new entries not already in the log
-                        for entry in &args.entries {
+                        for entry in &append_req.entries {
                             self.log.push(entry.clone());
                         }
 
                         // If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-                        if args.leader_commit > self.commit_index {
+                        if append_req.leader_commit > self.commit_index {
                             self.commit_index = std::cmp::min(
-                                args.leader_commit,
+                                append_req.leader_commit,
                                 self.last_log_index(),
                             );
                             // Apply committed entries to state machine
@@ -241,14 +259,14 @@ impl RaftNode {
             } else {
                 // prev_log_index is 0, meaning we're starting from the beginning
                 // Append any new entries
-                for entry in &args.entries {
+                for entry in &append_req.entries {
                     self.log.push(entry.clone());
                 }
 
                 // Update commit_index
-                if args.leader_commit > self.commit_index {
+                if append_req.leader_commit > self.commit_index {
                     self.commit_index = std::cmp::min(
-                        args.leader_commit,
+                        append_req.leader_commit,
                         self.last_log_index(),
                     );
                     // Apply committed entries to state machine
@@ -275,6 +293,10 @@ impl RaftNode {
         
         // Vote for self
         self.voted_for = Some(self.id);
+        
+        // Reset votes received (we've already voted for ourselves)
+        self.votes_received.clear();
+        self.votes_received.push(self.id);
         
         // Reset election timer (in real implementation, this would be handled by a timer)
         // For now, we just update the state
@@ -342,6 +364,98 @@ impl RaftNode {
             self.state = RaftState::Follower;
         }
     }
+
+    /// Handle a RequestVote result (called by candidate after receiving vote response)
+    /// Processes the response, updates term if needed, tracks votes, and becomes leader if majority reached
+    /// Returns true if this node became leader as a result
+    pub fn handle_request_vote_result(&mut self, peer_id: u64, result: &RequestVoteResult) -> bool {
+        // Process the response (updates term if needed)
+        self.process_request_vote_response(result);
+
+        // If we're no longer a candidate (e.g., term was updated), we can't become leader
+        if self.state != RaftState::Candidate {
+            return false;
+        }
+
+        // Track the vote if granted
+        if result.vote_granted && !self.votes_received.contains(&peer_id) {
+            self.votes_received.push(peer_id);
+        }
+
+        // Check if we have majority (including our own vote)
+        let total_nodes = 1 + self.peers.len(); // self + peers
+        let majority = (total_nodes / 2) + 1;
+        
+        if self.votes_received.len() >= majority {
+            self.become_leader();
+            return true;
+        }
+
+        false
+    }
+
+    /// Handle an AppendEntries result (called by leader after receiving replication response)
+    /// Processes the response, updates term if needed, tracks replication, and commits entries if majority reached
+    /// Returns the index of the highest committed entry (if any new entry was committed), or None
+    pub fn handle_append_entries_result(
+        &mut self,
+        peer_id: u64,
+        entry_index: u64,
+        result: &AppendEntriesResult,
+    ) -> Option<u64> {
+        // Process the response (updates term if needed)
+        self.process_append_entries_response(result);
+
+        // If we're no longer a leader (e.g., term was updated), we can't commit
+        if self.state != RaftState::Leader {
+            return None;
+        }
+
+        // Update match_index and next_index based on result
+        if result.success {
+            // Successfully replicated up to entry_index
+            if entry_index > 0 {
+                let current_match = self.match_index.get(&peer_id).copied().unwrap_or(0);
+                if entry_index > current_match {
+                    self.match_index.insert(peer_id, entry_index);
+                }
+                // Update next_index for next entry to send
+                self.next_index.insert(peer_id, entry_index + 1);
+            }
+        } else {
+            // Replication failed, decrement next_index for retry
+            let current_next = self.next_index.get(&peer_id).copied().unwrap_or(1);
+            if current_next > 1 {
+                self.next_index.insert(peer_id, current_next - 1);
+            }
+        }
+
+        // Check if entry_index is replicated to majority and can be committed
+        if entry_index == 0 {
+            return None; // No entry to commit
+        }
+
+        // Count how many nodes have replicated this entry (including leader)
+        let mut replicated_count = 1; // Leader has it
+        for (_, &match_idx) in &self.match_index {
+            if match_idx >= entry_index {
+                replicated_count += 1;
+            }
+        }
+
+        // Check if we have majority
+        let total_nodes = 1 + self.peers.len(); // self + peers
+        let majority = (total_nodes / 2) + 1;
+
+        if replicated_count >= majority && entry_index > self.commit_index {
+            // Commit the entry
+            self.commit_index = entry_index;
+            self.apply_committed_entries();
+            return Some(entry_index);
+        }
+
+        None
+    }
 }
 
 #[cfg(test)]
@@ -375,7 +489,7 @@ mod tests {
             last_log_index: 0,
             last_log_term: 0,
         };
-        let result = node.handle_request_vote(args);
+        let result = node.handle_request_vote(&args);
         assert!(result.vote_granted);
         assert_eq!(node.voted_for, Some(2));
     }
@@ -395,7 +509,7 @@ mod tests {
             }],
             leader_commit: 0,
         };
-        let result = node.handle_append_entries(args);
+        let result = node.handle_append_entries(&args);
         assert!(result.success);
         assert_eq!(node.log.len(), 1);
         assert_eq!(node.state, RaftState::Follower);

@@ -42,14 +42,12 @@ fn main() {
     println!("  Node 2 vote: {}", if vote_result_2.vote_granted { "GRANTED" } else { "DENIED" });
     println!("  Node 3 vote: {}", if vote_result_3.vote_granted { "GRANTED" } else { "DENIED" });
 
-    // Process responses to update term if needed
-    node1.process_request_vote_response(&vote_result_2);
-    node1.process_request_vote_response(&vote_result_3);
+    // Handle vote results (encapsulates term update, vote tracking, and becoming leader)
+    let became_leader_2 = node1.handle_request_vote_result(2, &vote_result_2);
+    let became_leader_3 = node1.handle_request_vote_result(3, &vote_result_3);
 
-    // Node 1 received 2 votes (itself + one other) = majority in 3-node cluster
-    if vote_result_2.vote_granted || vote_result_3.vote_granted {
+    if became_leader_2 || became_leader_3 {
         println!("\nNode 1 received majority of votes!");
-        node1.become_leader();
         println!("  Node 1 is now: {:?}", node1.state);
     }
     println!();
@@ -109,23 +107,14 @@ fn main() {
     println!("  Node 3 replication: {}", if append_result_3.success { "SUCCESS" } else { "FAILED" });
     println!("  Node 3 log length: {}", node3.log.len());
 
-    // Process responses to update term if needed
-    node1.process_append_entries_response(&append_result_2);
-    node1.process_append_entries_response(&append_result_3);
+    // Handle append entries results (encapsulates term update, replication tracking, and committing)
+    let committed_2 = node1.handle_append_entries_result(2, entry.index, &append_result_2);
+    let committed_3 = node1.handle_append_entries_result(3, entry.index, &append_result_3);
 
-    // If entry is replicated to majority, commit it
-    let mut replicated_count = 1; // Leader has it
-    if append_result_2.success {
-        replicated_count += 1;
-    }
-    if append_result_3.success {
-        replicated_count += 1;
-    }
-    
-    if replicated_count > 1 { // Majority in 3-node cluster
-        node1.commit_index = entry.index;
-        node1.apply_committed_entries();
-        println!("\nEntry committed (replicated to {} nodes)", replicated_count);
+    // If entry was committed, send updated commit_index to followers via AppendEntries (heartbeat)
+    if committed_2.is_some() || committed_3.is_some() {
+        let committed_index = committed_2.or(committed_3).unwrap();
+        println!("\nEntry committed (index: {})", committed_index);
         
         // Send updated commit_index to followers via AppendEntries (heartbeat)
         let heartbeat_2 = AppendEntriesArgs {

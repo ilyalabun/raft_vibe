@@ -70,6 +70,14 @@ Learned about Rust's ownership system and how to avoid unnecessary cloning. Chan
 
 Discovered a critical bug where followers could accept client commands, violating the Raft protocol. Fixed `append_log_entry` to check if the node is a leader before allowing log appends. Changed the return type to `Option<LogEntry>` - returns `Some(entry)` for leaders and `None` for followers. Updated the demo to show that followers properly reject client commands with a clear message. This ensures only leaders accept client requests, which is fundamental to Raft's consistency guarantees. The fix demonstrates how Rust's type system (using `Option`) helps enforce protocol correctness at compile time.
 
+## Day 2: Encapsulation and Better Abstractions
+
+**Prompt:** "Now, I want to encapsulate election, becoming leader, etc logic from `main.rs`. For this following methods are missing in RaftNode: handle_append_entries_result, handle_request_vote_result"
+
+**Encapsulating Vote and Replication Logic**
+
+Refactored the Raft implementation to better encapsulate election and replication logic within the `RaftNode` struct. Added a `votes_received` field to track which peers have granted votes during an election. Created `handle_request_vote_result` method that processes vote responses, tracks votes, and automatically transitions to leader when a majority is reached. Similarly, created `handle_append_entries_result` method that handles replication responses, updates `match_index` and `next_index` for each peer, and commits entries when replicated to a majority. Also improved code readability by using clearer variable names like `vote_req`, `append_req`, and `candidate_last_log_term`. The main demo was simplified to use these higher-level methods instead of manually tracking votes and replication counts. This refactoring follows better software design principles by keeping related logic together and reducing code duplication.
+
 ---
 
 ## Notes
