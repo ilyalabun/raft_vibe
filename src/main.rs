@@ -4,6 +4,8 @@
 //! Start by reading README.md and rust_basics.md!
 
 mod raft;
+mod transport;
+mod transport_inmemory;
 
 use raft::{RaftNode, RequestVoteArgs, AppendEntriesArgs};
 

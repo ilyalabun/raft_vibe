@@ -1,0 +1,246 @@
+//! In-memory transport implementation for testing
+
+use async_trait::async_trait;
+use std::collections::HashMap;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::raft::{
+    AppendEntriesArgs, AppendEntriesResult, RaftNode, RequestVoteArgs, RequestVoteResult,
+};
+use crate::transport::{Transport, TransportError};
+
+/// Request types that can be sent to a node
+enum Request {
+    RequestVote {
+        args: RequestVoteArgs,
+        reply: oneshot::Sender<RequestVoteResult>,
+    },
+    AppendEntries {
+        args: AppendEntriesArgs,
+        reply: oneshot::Sender<AppendEntriesResult>,
+    },
+}
+
+/// In-memory transport that uses channels for communication
+pub struct InMemoryTransport {
+    /// Senders to each node's request channel
+    senders: HashMap<u64, mpsc::Sender<Request>>,
+}
+
+impl InMemoryTransport {
+    /// Create a new in-memory transport with senders to all nodes
+    pub fn new(senders: HashMap<u64, mpsc::Sender<Request>>) -> Self {
+        Self { senders }
+    }
+}
+
+#[async_trait]
+impl Transport for InMemoryTransport {
+    async fn request_vote(
+        &self,
+        target: u64,
+        args: RequestVoteArgs,
+    ) -> Result<RequestVoteResult, TransportError> {
+        let sender = self.senders.get(&target).ok_or(TransportError::NodeNotFound)?;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        sender
+            .send(Request::RequestVote { args, reply: reply_tx })
+            .await
+            .map_err(|_| TransportError::ConnectionFailed)?;
+
+        reply_rx.await.map_err(|_| TransportError::ConnectionFailed)
+    }
+
+    async fn append_entries(
+        &self,
+        target: u64,
+        args: AppendEntriesArgs,
+    ) -> Result<AppendEntriesResult, TransportError> {
+        let sender = self.senders.get(&target).ok_or(TransportError::NodeNotFound)?;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        sender
+            .send(Request::AppendEntries { args, reply: reply_tx })
+            .await
+            .map_err(|_| TransportError::ConnectionFailed)?;
+
+        reply_rx.await.map_err(|_| TransportError::ConnectionFailed)
+    }
+}
+
+/// Handle for a node that processes incoming requests
+pub struct NodeHandle {
+    receiver: mpsc::Receiver<Request>,
+}
+
+impl NodeHandle {
+    /// Process one incoming request using the given RaftNode
+    pub async fn process_one(&mut self, node: &mut RaftNode) -> bool {
+        match self.receiver.recv().await {
+            Some(Request::RequestVote { args, reply }) => {
+                let result = node.handle_request_vote(&args);
+                let _ = reply.send(result);
+                true
+            }
+            Some(Request::AppendEntries { args, reply }) => {
+                let result = node.handle_append_entries(&args);
+                let _ = reply.send(result);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Create transports and handles for a cluster of nodes
+pub fn create_cluster(node_ids: &[u64]) -> (HashMap<u64, InMemoryTransport>, HashMap<u64, NodeHandle>) {
+    let mut senders: HashMap<u64, mpsc::Sender<Request>> = HashMap::new();
+    let mut handles: HashMap<u64, NodeHandle> = HashMap::new();
+
+    // Create a channel for each node
+    for &id in node_ids {
+        let (tx, rx) = mpsc::channel(32);
+        senders.insert(id, tx);
+        handles.insert(id, NodeHandle { receiver: rx });
+    }
+
+    // Create a transport for each node with senders to all other nodes
+    let mut transports: HashMap<u64, InMemoryTransport> = HashMap::new();
+    for &id in node_ids {
+        let other_senders: HashMap<u64, mpsc::Sender<Request>> = senders
+            .iter()
+            .filter(|(&k, _)| k != id)
+            .map(|(&k, v)| (k, v.clone()))
+            .collect();
+        transports.insert(id, InMemoryTransport::new(other_senders));
+    }
+
+    (transports, handles)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raft::RaftNode;
+
+    #[tokio::test]
+    async fn test_request_vote() {
+        let node_ids = vec![1, 2, 3];
+        let (transports, mut handles) = create_cluster(&node_ids);
+
+        let mut node2 = RaftNode::new(2, vec![1, 3]);
+
+        // Node 1 requests vote from node 2
+        let transport1 = transports.get(&1).unwrap();
+        let args = RequestVoteArgs {
+            term: 1,
+            candidate_id: 1,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+
+        let vote_future = transport1.request_vote(2, args);
+
+        // Process the request on node 2
+        let handle2 = handles.get_mut(&2).unwrap();
+        let (result, _) = tokio::join!(vote_future, handle2.process_one(&mut node2));
+
+        let result = result.unwrap();
+        assert!(result.vote_granted);
+        assert_eq!(result.term, 1);
+        assert_eq!(node2.voted_for, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_append_entries() {
+        let node_ids = vec![1, 2, 3];
+        let (transports, mut handles) = create_cluster(&node_ids);
+
+        let mut node2 = RaftNode::new(2, vec![1, 3]);
+
+        // Node 1 sends append entries to node 2
+        let transport1 = transports.get(&1).unwrap();
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+        };
+
+        let append_future = transport1.append_entries(2, args);
+
+        // Process the request on node 2
+        let handle2 = handles.get_mut(&2).unwrap();
+        let (result, _) = tokio::join!(append_future, handle2.process_one(&mut node2));
+
+        let result = result.unwrap();
+        assert!(result.success);
+        assert_eq!(result.term, 1);
+    }
+
+    #[tokio::test]
+    async fn test_node_not_found() {
+        let node_ids = vec![1, 2];
+        let (transports, _handles) = create_cluster(&node_ids);
+
+        let transport1 = transports.get(&1).unwrap();
+        let args = RequestVoteArgs {
+            term: 1,
+            candidate_id: 1,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+
+        // Try to send to non-existent node 99
+        let result = transport1.request_vote(99, args).await;
+        assert!(matches!(result, Err(TransportError::NodeNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_election_via_transport() {
+        let node_ids = vec![1, 2, 3];
+        let (transports, mut handles) = create_cluster(&node_ids);
+
+        let mut node1 = RaftNode::new(1, vec![2, 3]);
+        let mut node2 = RaftNode::new(2, vec![1, 3]);
+        let mut node3 = RaftNode::new(3, vec![1, 2]);
+
+        // Node 1 starts election
+        node1.start_election();
+
+        let transport1 = transports.get(&1).unwrap();
+        let args = RequestVoteArgs {
+            term: node1.current_term,
+            candidate_id: node1.id,
+            last_log_index: node1.last_log_index(),
+            last_log_term: node1.last_log_term(),
+        };
+
+        // Send vote requests to both peers concurrently
+        let vote2_future = transport1.request_vote(2, args.clone());
+        let vote3_future = transport1.request_vote(3, args);
+
+        // Extract handles to avoid multiple mutable borrows
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Process requests and collect results
+        let (result2, result3, _, _) = tokio::join!(
+            vote2_future,
+            vote3_future,
+            handle2.process_one(&mut node2),
+            handle3.process_one(&mut node3),
+        );
+
+        // Process vote results
+        let became_leader2 = node1.handle_request_vote_result(2, &result2.unwrap());
+        let became_leader3 = node1.handle_request_vote_result(3, &result3.unwrap());
+
+        // Node 1 should become leader after receiving majority
+        assert!(became_leader2 || became_leader3);
+        assert_eq!(node1.state, crate::raft::RaftState::Leader);
+    }
+}

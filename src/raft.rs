@@ -1,5 +1,5 @@
 //! Raft Consensus Algorithm Implementation
-//! 
+//!
 //! This module implements the Raft consensus protocol as described in:
 //! "In Search of an Understandable Consensus Algorithm" by Diego Ongaro and John Ousterhout
 

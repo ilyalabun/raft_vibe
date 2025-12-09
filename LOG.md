@@ -78,6 +78,38 @@ Discovered a critical bug where followers could accept client commands, violatin
 
 Refactored the Raft implementation to better encapsulate election and replication logic within the `RaftNode` struct. Added a `votes_received` field to track which peers have granted votes during an election. Created `handle_request_vote_result` method that processes vote responses, tracks votes, and automatically transitions to leader when a majority is reached. Similarly, created `handle_append_entries_result` method that handles replication responses, updates `match_index` and `next_index` for each peer, and commits entries when replicated to a majority. Also improved code readability by using clearer variable names like `vote_req`, `append_req`, and `candidate_last_log_term`. The main demo was simplified to use these higher-level methods instead of manually tracking votes and replication counts. This refactoring follows better software design principles by keeping related logic together and reducing code duplication.
 
+## Day 3: Transport Abstraction
+
+**Prompt:** "I want to introduce simple Transport abstraction. It should use tokio async library and have 2 methods: request_vote and append_entries"
+
+**Creating the Transport Trait**
+
+Introduced an async transport abstraction for Raft RPC communication. Added `tokio` and `async-trait` dependencies to enable async/await syntax in traits. Created a `Transport` trait with two async methods: `request_vote` and `append_entries`, both returning `Result` types with a custom `TransportError` enum for error handling (ConnectionFailed, Timeout, NodeNotFound). This abstraction allows different transport implementations (TCP, gRPC, in-memory) to be swapped without changing the Raft logic.
+
+**Prompt:** "please extract transport into separate file"
+
+**Modularizing the Codebase**
+
+Extracted the `Transport` trait and `TransportError` enum into a dedicated `src/transport.rs` file. Updated imports to reference the raft module's RPC types. This separation of concerns makes the codebase more maintainable and clearly separates the transport layer from the consensus algorithm.
+
+**Prompt:** "ok, now I want simplest in-memory transport implementation. It should live in a separate transport_inmemory.rs file. Implementation should be the simplest, try to avoid locks if possible. Write tests for this implementation"
+
+**Implementing Lock-Free In-Memory Transport**
+
+Created an in-memory transport implementation using tokio channels instead of locks. The design uses `mpsc` channels for sending requests and `oneshot` channels for receiving responses. Each node has a `NodeHandle` that receives requests and processes them with its `RaftNode`. The `InMemoryTransport` holds senders to all peer nodes. Added a `create_cluster` helper function to easily set up a test cluster. Wrote four tests covering RequestVote, AppendEntries, error handling for unknown nodes, and a full election flow through the transport layer. All 8 tests pass.
+
+**Prompt:** "what does ? mean in rust?"
+
+**Understanding Error Propagation**
+
+Learned about Rust's `?` operator for error propagation. It's shorthand for matching on a `Result` - if `Ok`, unwrap the value and continue; if `Err`, return early from the function with that error. The function must return a compatible `Result` type for `?` to work.
+
+**Prompt:** "why we don't need lock for RaftNode in process_one?"
+
+**Understanding Rust's Ownership Model**
+
+Explored why locks aren't needed when using `&mut RaftNode`. Rust's borrow checker guarantees at compile time that only one mutable reference can exist at a time. The caller is responsible for exclusive access, and any attempt to use the node elsewhere while borrowed would be rejected by the compiler. Locks would only be needed if multiple tasks shared ownership via `Arc<Mutex<RaftNode>>`.
+
 ---
 
 ## Notes
