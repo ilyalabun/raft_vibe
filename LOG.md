@@ -110,6 +110,33 @@ Learned about Rust's `?` operator for error propagation. It's shorthand for matc
 
 Explored why locks aren't needed when using `&mut RaftNode`. Rust's borrow checker guarantees at compile time that only one mutable reference can exist at a time. The caller is responsible for exclusive access, and any attempt to use the node elsewhere while borrowed would be rejected by the compiler. Locks would only be needed if multiple tasks shared ownership via `Arc<Mutex<RaftNode>>`.
 
+## Day 4: RaftServer and Architecture Refactoring
+
+Created a generic RaftServer and refactored the codebase into a clean three-layer architecture: RaftCore (sync state machine), RaftNode (async consensus), and RaftServer (client API). Fixed async deadlock issues and learned about proper concurrent RPC handling.
+
+**Prompt:** "Yes, please create RaftServer. Try to make it generic, so it'll be easier to change transport"
+
+**Creating Generic RaftServer**
+
+Created a generic `RaftServer<T: Transport>` that handles client commands and coordinates with the Raft consensus layer. The server spawns a background tokio task to process client commands. It provides a `RaftHandle` for clients to submit commands asynchronously. The server uses `SharedCore` (`Arc<Mutex<RaftCore>>`) to share state between the server and incoming RPC handlers. Fixed deadlock issues by sending all RPC requests concurrently using `futures::future::join_all` instead of sequentially. Added the `futures` crate dependency.
+
+**Prompt:** "Should handle_submit and replicate_to_peers be part of RaftNode?"
+
+**Discussing Code Organization**
+
+Discussed where consensus logic should live. The argument for keeping replication in RaftServer was that RaftCore is sync and transport-agnostic. But replication is core to Raft consensus - a leader must replicate to achieve consensus. Decided to create a layered architecture with consensus logic in a separate wrapper.
+
+**Prompt:** "RaftCore sounds good!"
+
+**Refactoring to Three-Layer Architecture**
+
+Refactored the codebase into a cleaner three-layer architecture:
+- `RaftCore` (raft_core.rs) - Sync state machine, transport-agnostic. Handles RPCs and state transitions.
+- `RaftNode<T: Transport>` (raft_node.rs) - Async consensus logic. Wraps RaftCore and contains `request_votes()` and `replicate_to_peers()`. Generic over transport.
+- `RaftServer<T: Transport>` (raft_server.rs) - Client command handling. Contains RaftNode and coordinates client requests.
+
+This separation keeps concerns clean: state management, consensus protocol, and client API are each in their own layer. The generic transport parameter makes it easy to swap implementations.
+
 ---
 
 ## Notes

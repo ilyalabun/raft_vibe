@@ -3,19 +3,21 @@
 //! This is an educational implementation of the Raft consensus protocol.
 //! Start by reading README.md and rust_basics.md!
 
-mod raft;
+mod raft_node;
+mod raft_core;
+mod raft_server;
 mod transport;
 mod transport_inmemory;
 
-use raft::{RaftNode, RequestVoteArgs, AppendEntriesArgs};
+use raft_core::{RaftCore, RequestVoteArgs, AppendEntriesArgs};
 
 fn main() {
     println!("=== Raft Consensus Algorithm Demo ===\n");
 
     // Create three nodes in a cluster
-    let mut node1 = RaftNode::new(1, vec![2, 3]);
-    let mut node2 = RaftNode::new(2, vec![1, 3]);
-    let mut node3 = RaftNode::new(3, vec![1, 2]);
+    let mut node1 = RaftCore::new(1, vec![2, 3]);
+    let mut node2 = RaftCore::new(2, vec![1, 3]);
+    let mut node3 = RaftCore::new(3, vec![1, 2]);
 
     println!("Created 3-node cluster:");
     println!("  Node 1: {:?}", node1.state);

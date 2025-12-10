@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::raft::{
-    AppendEntriesArgs, AppendEntriesResult, RaftNode, RequestVoteArgs, RequestVoteResult,
+use crate::raft_core::{
+    AppendEntriesArgs, AppendEntriesResult, RaftCore, RequestVoteArgs, RequestVoteResult,
 };
 use crate::transport::{Transport, TransportError};
 
@@ -75,20 +75,43 @@ pub struct NodeHandle {
 }
 
 impl NodeHandle {
-    /// Process one incoming request using the given RaftNode
-    pub async fn process_one(&mut self, node: &mut RaftNode) -> bool {
+    /// Process one incoming request using the given RaftCore
+    pub async fn process_one(&mut self, node: &mut RaftCore) -> bool {
         match self.receiver.recv().await {
-            Some(Request::RequestVote { args, reply }) => {
-                let result = node.handle_request_vote(&args);
-                let _ = reply.send(result);
-                true
-            }
-            Some(Request::AppendEntries { args, reply }) => {
-                let result = node.handle_append_entries(&args);
-                let _ = reply.send(result);
+            Some(request) => {
+                Self::handle_request(request, node);
                 true
             }
             None => false,
+        }
+    }
+
+    /// Process one request using a shared node (for use with RaftServer)
+    /// This method receives the request first, then briefly locks to process
+    pub async fn process_one_shared(
+        &mut self,
+        node: &std::sync::Arc<tokio::sync::Mutex<RaftCore>>,
+    ) -> bool {
+        match self.receiver.recv().await {
+            Some(request) => {
+                let mut n = node.lock().await;
+                Self::handle_request(request, &mut n);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn handle_request(request: Request, node: &mut RaftCore) {
+        match request {
+            Request::RequestVote { args, reply } => {
+                let result = node.handle_request_vote(&args);
+                let _ = reply.send(result);
+            }
+            Request::AppendEntries { args, reply } => {
+                let result = node.handle_append_entries(&args);
+                let _ = reply.send(result);
+            }
         }
     }
 }
@@ -122,14 +145,14 @@ pub fn create_cluster(node_ids: &[u64]) -> (HashMap<u64, InMemoryTransport>, Has
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::RaftNode;
+    use crate::raft_core::RaftCore;
 
     #[tokio::test]
     async fn test_request_vote() {
         let node_ids = vec![1, 2, 3];
         let (transports, mut handles) = create_cluster(&node_ids);
 
-        let mut node2 = RaftNode::new(2, vec![1, 3]);
+        let mut node2 = RaftCore::new(2, vec![1, 3]);
 
         // Node 1 requests vote from node 2
         let transport1 = transports.get(&1).unwrap();
@@ -157,7 +180,7 @@ mod tests {
         let node_ids = vec![1, 2, 3];
         let (transports, mut handles) = create_cluster(&node_ids);
 
-        let mut node2 = RaftNode::new(2, vec![1, 3]);
+        let mut node2 = RaftCore::new(2, vec![1, 3]);
 
         // Node 1 sends append entries to node 2
         let transport1 = transports.get(&1).unwrap();
@@ -204,9 +227,9 @@ mod tests {
         let node_ids = vec![1, 2, 3];
         let (transports, mut handles) = create_cluster(&node_ids);
 
-        let mut node1 = RaftNode::new(1, vec![2, 3]);
-        let mut node2 = RaftNode::new(2, vec![1, 3]);
-        let mut node3 = RaftNode::new(3, vec![1, 2]);
+        let mut node1 = RaftCore::new(1, vec![2, 3]);
+        let mut node2 = RaftCore::new(2, vec![1, 3]);
+        let mut node3 = RaftCore::new(3, vec![1, 2]);
 
         // Node 1 starts election
         node1.start_election();
@@ -241,6 +264,6 @@ mod tests {
 
         // Node 1 should become leader after receiving majority
         assert!(became_leader2 || became_leader3);
-        assert_eq!(node1.state, crate::raft::RaftState::Leader);
+        assert_eq!(node1.state, crate::raft_core::RaftState::Leader);
     }
 }

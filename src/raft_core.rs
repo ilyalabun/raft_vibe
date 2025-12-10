@@ -75,8 +75,8 @@ pub struct AppendEntriesResult {
     pub success: bool,
 }
 
-/// Core Raft node implementation
-pub struct RaftNode {
+/// Core Raft state machine (sync, transport-agnostic)
+pub struct RaftCore {
     // Persistent state on all servers (updated on stable storage before responding to RPCs)
     /// Latest term server has seen (initialized to 0 on first boot, increases monotonically)
     pub current_term: u64,
@@ -108,10 +108,10 @@ pub struct RaftNode {
     votes_received: Vec<u64>,
 }
 
-impl RaftNode {
-    /// Create a new Raft node
+impl RaftCore {
+    /// Create a new Raft core
     pub fn new(id: u64, peers: Vec<u64>) -> Self {
-        RaftNode {
+        RaftCore {
             current_term: 0,
             voted_for: None,
             log: Vec::new(),
@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn test_new_node() {
-        let node = RaftNode::new(1, vec![2, 3]);
+        let node = RaftCore::new(1, vec![2, 3]);
         assert_eq!(node.id, 1);
         assert_eq!(node.current_term, 0);
         assert_eq!(node.state, RaftState::Follower);
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn test_election() {
-        let mut node = RaftNode::new(1, vec![2, 3]);
+        let mut node = RaftCore::new(1, vec![2, 3]);
         node.start_election();
         assert_eq!(node.state, RaftState::Candidate);
         assert_eq!(node.current_term, 1);
@@ -482,7 +482,7 @@ mod tests {
 
     #[test]
     fn test_request_vote() {
-        let mut node = RaftNode::new(1, vec![2, 3]);
+        let mut node = RaftCore::new(1, vec![2, 3]);
         let args = RequestVoteArgs {
             term: 1,
             candidate_id: 2,
@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_append_entries() {
-        let mut node = RaftNode::new(1, vec![2, 3]);
+        let mut node = RaftCore::new(1, vec![2, 3]);
         let args = AppendEntriesArgs {
             term: 1,
             leader_id: 2,
