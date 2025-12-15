@@ -75,6 +75,27 @@ pub struct AppendEntriesResult {
     pub success: bool,
 }
 
+/// Events that can be triggered by handling RPCs
+/// Used to communicate actions the server layer should take
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RaftEvent {
+    /// Reset the election timeout (received valid heartbeat/append from leader)
+    ResetElectionTimeout,
+    /// No action needed
+    None,
+}
+
+/// Result of handling an AppendEntries RPC, includes both the response and any events
+#[derive(Debug, Clone)]
+pub struct HandleAppendEntriesOutput {
+    /// The response to send back to the leader
+    pub result: AppendEntriesResult,
+    /// Event triggered by this RPC (e.g., reset election timeout)
+    pub event: RaftEvent,
+    /// Leader ID if we recognized a valid leader
+    pub leader_id: Option<u64>,
+}
+
 /// Core Raft state machine (sync, transport-agnostic)
 pub struct RaftCore {
     // Persistent state on all servers (updated on stable storage before responding to RPCs)
@@ -200,7 +221,8 @@ impl RaftCore {
     }
 
     /// Handle AppendEntries RPC (heartbeat or log replication)
-    pub fn handle_append_entries(&mut self, append_req: &AppendEntriesArgs) -> AppendEntriesResult {
+    /// Returns the result to send back, plus any events the server should handle
+    pub fn handle_append_entries(&mut self, append_req: &AppendEntriesArgs) -> HandleAppendEntriesOutput {
         // If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
         if append_req.term > self.current_term {
             self.current_term = append_req.term;
@@ -208,15 +230,18 @@ impl RaftCore {
             self.state = RaftState::Follower;
         }
 
+        // Track whether we should reset election timeout and who the leader is
+        let mut event = RaftEvent::None;
+        let mut leader_id = None;
+
         let success = if append_req.term < self.current_term {
             // Reply false if term < currentTerm
             false
         } else {
-            // If we receive AppendEntries from a valid leader, we're a follower
-            // Note: leader_id is used to identify which leader is sending the request
-            // In a full implementation, this would be used for leader tracking
-            let _leader_id = append_req.leader_id;
+            // Valid AppendEntries from current leader - reset election timeout
             self.state = RaftState::Follower;
+            event = RaftEvent::ResetElectionTimeout;
+            leader_id = Some(append_req.leader_id);
 
             // Reply false if log doesn't contain an entry at prev_log_index with term matching prev_log_term
             if append_req.prev_log_index > 0 {
@@ -268,7 +293,7 @@ impl RaftCore {
                     self.commit_index = std::cmp::min(
                         append_req.leader_commit,
                         self.last_log_index(),
-                    );
+                        );
                     // Apply committed entries to state machine
                     self.apply_committed_entries();
                 }
@@ -277,9 +302,13 @@ impl RaftCore {
             }
         };
 
-        AppendEntriesResult {
-            term: self.current_term,
-            success,
+        HandleAppendEntriesOutput {
+            result: AppendEntriesResult {
+                term: self.current_term,
+                success,
+            },
+            event,
+            leader_id,
         }
     }
 
@@ -509,10 +538,56 @@ mod tests {
             }],
             leader_commit: 0,
         };
-        let result = node.handle_append_entries(&args);
-        assert!(result.success);
+        let output = node.handle_append_entries(&args);
+        assert!(output.result.success);
+        assert_eq!(output.event, RaftEvent::ResetElectionTimeout);
+        assert_eq!(output.leader_id, Some(2));
         assert_eq!(node.log.len(), 1);
         assert_eq!(node.state, RaftState::Follower);
+    }
+
+    #[test]
+    fn test_append_entries_stale_term_no_reset() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        // Node is at term 2
+        node.current_term = 2;
+
+        // Receive AppendEntries from stale term 1
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+        };
+        let output = node.handle_append_entries(&args);
+
+        // Should reject and NOT reset election timeout
+        assert!(!output.result.success);
+        assert_eq!(output.event, RaftEvent::None);
+        assert_eq!(output.leader_id, None);
+    }
+
+    #[test]
+    fn test_heartbeat_resets_election_timeout() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+
+        // Receive empty heartbeat
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![], // Empty = heartbeat
+            leader_commit: 0,
+        };
+        let output = node.handle_append_entries(&args);
+
+        // Heartbeat should succeed and reset timeout
+        assert!(output.result.success);
+        assert_eq!(output.event, RaftEvent::ResetElectionTimeout);
+        assert_eq!(output.leader_id, Some(2));
     }
 }
 

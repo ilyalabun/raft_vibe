@@ -3,6 +3,7 @@
 //! This is an educational implementation of the Raft consensus protocol.
 //! Start by reading README.md and rust_basics.md!
 
+mod config;
 mod raft_node;
 mod raft_core;
 mod raft_server;
@@ -94,8 +95,8 @@ fn main() {
         entries: vec![entry.clone()],
         leader_commit: node1.commit_index,
     };
-    let append_result_2 = node2.handle_append_entries(&append_args_2);
-    println!("  Node 2 replication: {}", if append_result_2.success { "SUCCESS" } else { "FAILED" });
+    let append_output_2 = node2.handle_append_entries(&append_args_2);
+    println!("  Node 2 replication: {}", if append_output_2.result.success { "SUCCESS" } else { "FAILED" });
     println!("  Node 2 log length: {}", node2.log.len());
 
     // Replicate to Node 3
@@ -107,13 +108,13 @@ fn main() {
         entries: vec![entry.clone()],
         leader_commit: node1.commit_index,
     };
-    let append_result_3 = node3.handle_append_entries(&append_args_3);
-    println!("  Node 3 replication: {}", if append_result_3.success { "SUCCESS" } else { "FAILED" });
+    let append_output_3 = node3.handle_append_entries(&append_args_3);
+    println!("  Node 3 replication: {}", if append_output_3.result.success { "SUCCESS" } else { "FAILED" });
     println!("  Node 3 log length: {}", node3.log.len());
 
     // Handle append entries results (encapsulates term update, replication tracking, and committing)
-    let committed_2 = node1.handle_append_entries_result(2, entry.index, &append_result_2);
-    let committed_3 = node1.handle_append_entries_result(3, entry.index, &append_result_3);
+    let committed_2 = node1.handle_append_entries_result(2, entry.index, &append_output_2.result);
+    let committed_3 = node1.handle_append_entries_result(3, entry.index, &append_output_3.result);
 
     // If entry was committed, send updated commit_index to followers via AppendEntries (heartbeat)
     if committed_2.is_some() || committed_3.is_some() {

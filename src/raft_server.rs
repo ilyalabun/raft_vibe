@@ -1,7 +1,10 @@
 //! RaftServer - High-level Raft server for handling client commands
 
+use std::pin::pin;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::{interval, sleep_until, Instant};
 
+use crate::config::RaftConfig;
 use crate::raft_node::{RaftNode, SharedCore};
 use crate::raft_core::{RaftCore, RaftState};
 use crate::transport::{Transport, TransportError};
@@ -23,6 +26,16 @@ enum Command {
         reply: oneshot::Sender<Result<u64, RaftError>>,
     },
 }
+
+/// Events that can be sent to the server loop
+#[derive(Debug, Clone)]
+pub enum ServerEvent {
+    /// Reset the election timeout (received valid heartbeat from leader)
+    ResetElectionTimeout,
+}
+
+/// Sender for server events (used by transport layer to notify server)
+pub type EventSender = mpsc::Sender<ServerEvent>;
 
 /// Handle for interacting with a running RaftServer
 #[derive(Clone)]
@@ -52,21 +65,32 @@ pub struct RaftServer<T: Transport> {
     node: RaftNode<T>,
     command_rx: mpsc::Receiver<Command>,
     command_tx: mpsc::Sender<Command>,
+    event_rx: mpsc::Receiver<ServerEvent>,
+    config: RaftConfig,
 }
 
 impl<T: Transport + 'static> RaftServer<T> {
-    /// Create a new RaftServer
-    /// Returns the server and a shared reference to the core for incoming RPC handling
-    pub fn new(core: RaftCore, transport: T) -> (Self, SharedCore) {
+    /// Create a new RaftServer with default config
+    /// Returns the server, shared core for RPC handling, and event sender for timeout resets
+    pub fn new(core: RaftCore, transport: T) -> (Self, SharedCore, EventSender) {
+        Self::with_config(core, transport, RaftConfig::default())
+    }
+
+    /// Create a new RaftServer with custom config
+    /// Returns the server, shared core for RPC handling, and event sender for timeout resets
+    pub fn with_config(core: RaftCore, transport: T, config: RaftConfig) -> (Self, SharedCore, EventSender) {
         let (command_tx, command_rx) = mpsc::channel(32);
+        let (event_tx, event_rx) = mpsc::channel(32);
         let node = RaftNode::new(core, transport);
         let shared_core = node.shared_core();
         let server = Self {
             node,
             command_rx,
             command_tx,
+            event_rx,
+            config,
         };
-        (server, shared_core)
+        (server, shared_core, event_tx)
     }
 
     /// Start the server and return a handle for interaction
@@ -82,13 +106,55 @@ impl<T: Transport + 'static> RaftServer<T> {
 
     /// Main server loop
     async fn run(mut self) {
+        let mut heartbeat_interval = interval(self.config.heartbeat_interval);
+        let mut election_deadline = Instant::now() + self.config.random_election_timeout();
+
         loop {
-            match self.command_rx.recv().await {
-                Some(Command::Submit { command, reply }) => {
-                    let result = self.handle_submit(command).await;
-                    let _ = reply.send(result);
+            // Create a fresh sleep future each iteration that will fire at election_deadline
+            let election_sleep = pin!(sleep_until(election_deadline));
+
+            tokio::select! {
+                // Handle client commands
+                Some(cmd) = self.command_rx.recv() => {
+                    match cmd {
+                        Command::Submit { command, reply } => {
+                            let result = self.handle_submit(command).await;
+                            let _ = reply.send(result);
+                        }
+                    }
                 }
-                None => break, // Channel closed, shutdown
+                // Handle events from transport layer (e.g., heartbeat received)
+                Some(event) = self.event_rx.recv() => {
+                    match event {
+                        ServerEvent::ResetElectionTimeout => {
+                            // Update deadline - next iteration will create new sleep with this deadline
+                            election_deadline = Instant::now() + self.config.random_election_timeout();
+                        }
+                    }
+                }
+                // Send heartbeats if leader
+                _ = heartbeat_interval.tick() => {
+                    if self.node.state().await == RaftState::Leader {
+                        self.node.send_heartbeat().await;
+                    }
+                }
+                // Election timeout - start election if not leader
+                _ = election_sleep => {
+                    let state = self.node.state().await;
+                    if state != RaftState::Leader {
+                        // Start election
+                        self.node.start_election().await;
+                        let became_leader = self.node.request_votes().await;
+
+                        if became_leader {
+                            // Immediately send heartbeat to establish leadership
+                            self.node.send_heartbeat().await;
+                        }
+                    }
+                    // Reset election timeout for next iteration
+                    election_deadline = Instant::now() + self.config.random_election_timeout();
+                }
+                else => break, // All channels closed, shutdown
             }
         }
     }
@@ -141,7 +207,9 @@ impl<T: Transport + 'static> RaftServer<T> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::Mutex;
+    use crate::config::RaftConfig;
     use crate::transport_inmemory::create_cluster;
 
     #[tokio::test]
@@ -152,7 +220,7 @@ mod tests {
         let core1 = RaftCore::new(1, vec![2, 3]);
         let transport1 = transports.remove(&1).unwrap();
 
-        let (server, _shared_core) = RaftServer::new(core1, transport1);
+        let (server, _shared_core, _event_tx) = RaftServer::new(core1, transport1);
         let handle = server.start();
 
         // Node is not leader, should fail
@@ -171,7 +239,7 @@ mod tests {
 
         let transport1 = transports.remove(&1).unwrap();
 
-        let (server1, _shared1) = RaftServer::new(core1, transport1);
+        let (server1, _shared1, _event_tx) = RaftServer::new(core1, transport1);
         let shared2 = Arc::new(Mutex::new(core2));
         let shared3 = Arc::new(Mutex::new(core3));
 
@@ -203,7 +271,7 @@ mod tests {
 
         let transport1 = transports.remove(&1).unwrap();
 
-        let (server1, shared1) = RaftServer::new(core1, transport1);
+        let (server1, shared1, _event_tx) = RaftServer::new(core1, transport1);
         let shared2 = Arc::new(Mutex::new(core2));
         let shared3 = Arc::new(Mutex::new(core3));
 
@@ -237,5 +305,95 @@ mod tests {
         assert_eq!(server1.commit_index().await, entry_index);
         assert_eq!(shared2.lock().await.log.len(), 1);
         assert_eq!(shared3.lock().await.log.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_election_timeout_triggers_election() {
+        let node_ids = vec![1, 2, 3];
+        let (mut transports, mut handles) = create_cluster(&node_ids);
+
+        let core1 = RaftCore::new(1, vec![2, 3]);
+        let core2 = RaftCore::new(2, vec![1, 3]);
+        let core3 = RaftCore::new(3, vec![1, 2]);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        // With paused time, actual duration values don't affect test speed
+        let config = RaftConfig::default()
+            .with_election_timeout(Duration::from_millis(300), Duration::from_millis(500));
+
+        let (server1, shared1, _event_tx) = RaftServer::with_config(core1, transport1, config);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        // Verify node starts as follower
+        assert_eq!(shared1.lock().await.state, RaftState::Follower);
+        assert_eq!(shared1.lock().await.current_term, 0);
+
+        // Start server (runs in background)
+        let _handle = server1.start();
+
+        // Get handles for processing incoming requests
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Spawn task to process vote requests when they arrive
+        let shared2_clone = shared2.clone();
+        let shared3_clone = shared3.clone();
+        tokio::spawn(async move {
+            tokio::join!(
+                handle2.process_one_shared(&shared2_clone),
+                handle3.process_one_shared(&shared3_clone),
+            );
+        });
+
+        // Advance time past election timeout (max is 500ms)
+        // With paused time, we need to advance and yield multiple times
+        // to let all tasks make progress
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // Node 1 should have started election and become leader
+        let state = shared1.lock().await.state;
+        let term = shared1.lock().await.current_term;
+
+        assert_eq!(state, RaftState::Leader, "Node should become leader after election timeout");
+        assert!(term >= 1, "Term should have increased from election");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_no_election_before_timeout() {
+        let node_ids = vec![1, 2, 3];
+        let (mut transports, _handles) = create_cluster(&node_ids);
+
+        let core1 = RaftCore::new(1, vec![2, 3]);
+        let transport1 = transports.remove(&1).unwrap();
+
+        let config = RaftConfig::default()
+            .with_election_timeout(Duration::from_millis(300), Duration::from_millis(500));
+
+        let (server1, shared1, _event_tx) = RaftServer::with_config(core1, transport1, config);
+
+        // Verify node starts as follower at term 0
+        assert_eq!(shared1.lock().await.state, RaftState::Follower);
+        assert_eq!(shared1.lock().await.current_term, 0);
+
+        // Start server (runs in background)
+        let _handle = server1.start();
+
+        // Advance time but NOT past minimum election timeout (300ms)
+        tokio::time::advance(Duration::from_millis(200)).await;
+
+        // Yield to let server loop run
+        tokio::task::yield_now().await;
+
+        // Node should still be follower at term 0 (no election started)
+        let state = shared1.lock().await.state;
+        let term = shared1.lock().await.current_term;
+
+        assert_eq!(state, RaftState::Follower, "Node should remain follower before election timeout");
+        assert_eq!(term, 0, "Term should not have changed before election timeout");
     }
 }

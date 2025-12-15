@@ -109,8 +109,9 @@ impl NodeHandle {
                 let _ = reply.send(result);
             }
             Request::AppendEntries { args, reply } => {
-                let result = node.handle_append_entries(&args);
-                let _ = reply.send(result);
+                let output = node.handle_append_entries(&args);
+                // Transport only returns the result; events are handled locally
+                let _ = reply.send(output.result);
             }
         }
     }

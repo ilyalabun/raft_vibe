@@ -142,6 +142,78 @@ impl<T: Transport> RaftNode<T> {
     pub async fn commit_index(&self) -> u64 {
         self.core.lock().await.commit_index
     }
+
+    /// Send heartbeat to all peers
+    /// Heartbeats in Raft are AppendEntries RPCs that also include any entries
+    /// the follower might be missing (for catch-up). Returns true if still leader.
+    pub async fn send_heartbeat(&self) -> bool {
+        let requests_to_send = {
+            let core = self.core.lock().await;
+
+            // Only leaders send heartbeats
+            if core.state != RaftState::Leader {
+                return false;
+            }
+
+            let mut requests_to_send = Vec::new();
+            for &peer_id in &core.peers {
+                let next_idx = core.next_index.get(&peer_id).copied().unwrap_or(1);
+                let prev_log_index = next_idx - 1;
+                let prev_log_term = if prev_log_index == 0 {
+                    0
+                } else {
+                    core.log
+                        .get((prev_log_index - 1) as usize)
+                        .map(|e| e.term)
+                        .unwrap_or(0)
+                };
+
+                // Include entries from next_idx onwards for catch-up
+                let entries: Vec<_> = core
+                    .log
+                    .iter()
+                    .filter(|e| e.index >= next_idx)
+                    .cloned()
+                    .collect();
+
+                // Track the last entry index we're sending (for result handling)
+                let last_entry_index = entries.last().map(|e| e.index).unwrap_or(0);
+
+                let args = AppendEntriesArgs {
+                    term: core.current_term,
+                    leader_id: core.id,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    leader_commit: core.commit_index,
+                };
+                requests_to_send.push((peer_id, args, last_entry_index));
+            }
+            requests_to_send
+        };
+
+        // Send to all peers concurrently (lock released)
+        let futures: Vec<_> = requests_to_send
+            .into_iter()
+            .map(|(peer_id, args, last_entry_index)| {
+                let transport = &self.transport;
+                async move { (peer_id, transport.append_entries(peer_id, args).await, last_entry_index) }
+            })
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+
+        // Process results
+        for (peer_id, result, last_entry_index) in results {
+            if let Ok(result) = result {
+                let mut core = self.core.lock().await;
+                core.handle_append_entries_result(peer_id, last_entry_index, &result);
+            }
+        }
+
+        // Return whether we're still leader
+        self.core.lock().await.state == RaftState::Leader
+    }
 }
 
 #[cfg(test)]
@@ -226,5 +298,102 @@ mod tests {
         assert_eq!(node1.commit_index().await, entry_index);
         assert_eq!(shared2.lock().await.log.len(), 1);
         assert_eq!(shared3.lock().await.log.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat() {
+        let node_ids = vec![1, 2, 3];
+        let (mut transports, mut handles) = create_cluster(&node_ids);
+
+        let core1 = RaftCore::new(1, vec![2, 3]);
+        let core2 = RaftCore::new(2, vec![1, 3]);
+        let core3 = RaftCore::new(3, vec![1, 2]);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let node1 = RaftNode::new(core1, transport1);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Win election first
+        node1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            node1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(node1.state().await, RaftState::Leader);
+
+        // Send heartbeat
+        let (still_leader, _, _) = tokio::join!(
+            node1.send_heartbeat(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+
+        // Should still be leader after heartbeat
+        assert!(still_leader);
+        assert_eq!(node1.state().await, RaftState::Leader);
+
+        // Followers should remain followers with updated term
+        assert_eq!(shared2.lock().await.state, RaftState::Follower);
+        assert_eq!(shared3.lock().await.state, RaftState::Follower);
+        assert_eq!(shared2.lock().await.current_term, 1);
+        assert_eq!(shared3.lock().await.current_term, 1);
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_catches_up_followers() {
+        let node_ids = vec![1, 2, 3];
+        let (mut transports, mut handles) = create_cluster(&node_ids);
+
+        let core1 = RaftCore::new(1, vec![2, 3]);
+        let core2 = RaftCore::new(2, vec![1, 3]);
+        let core3 = RaftCore::new(3, vec![1, 2]);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let node1 = RaftNode::new(core1, transport1);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Win election first
+        node1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            node1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(node1.state().await, RaftState::Leader);
+
+        // Add entries to leader's log without replicating
+        {
+            let mut core = node1.core.lock().await;
+            core.append_log_entry("SET x=1".to_string()).unwrap();
+            core.append_log_entry("SET y=2".to_string()).unwrap();
+        }
+
+        // Verify followers don't have entries yet
+        assert_eq!(shared2.lock().await.log.len(), 0);
+        assert_eq!(shared3.lock().await.log.len(), 0);
+
+        // Send heartbeat - should replicate missing entries
+        let (_, _, _) = tokio::join!(
+            node1.send_heartbeat(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+
+        // Followers should now have the entries
+        assert_eq!(shared2.lock().await.log.len(), 2);
+        assert_eq!(shared3.lock().await.log.len(), 2);
+        assert_eq!(shared2.lock().await.log[0].command, "SET x=1");
+        assert_eq!(shared2.lock().await.log[1].command, "SET y=2");
     }
 }

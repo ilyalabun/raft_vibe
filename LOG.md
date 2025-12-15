@@ -137,6 +137,38 @@ Refactored the codebase into a cleaner three-layer architecture:
 
 This separation keeps concerns clean: state management, consensus protocol, and client API are each in their own layer. The generic transport parameter makes it easy to swap implementations.
 
+## Day 5: Heartbeat and Election Timeout
+
+**Prompt:** "ok, now I want to implement Raft's heartbit functionality"
+
+**Implementing Heartbeat Functionality**
+
+Implemented Raft's heartbeat mechanism, which is essential for leader authority and follower liveness. Created a `RaftConfig` struct in a new `config.rs` module to hold timing parameters (heartbeat interval, election timeout min/max). Added `send_heartbeat()` method to `RaftNode` that sends AppendEntries RPCs to all peers - importantly, heartbeats include any missing log entries to help followers catch up, not just empty messages. Updated `RaftServer`'s main loop to use `tokio::select!` for handling multiple concurrent concerns: client commands, heartbeat timer (fires every 150ms for leaders), and election timeout.
+
+**Prompt:** "Can heartbeat replicate existing entries to 'catch up' followers?"
+
+**Heartbeats as Catch-Up Mechanism**
+
+Confirmed that heartbeats should include missing entries for followers that are behind. Modified `send_heartbeat()` to check each peer's `next_index` and include any entries they're missing. This is how Raft efficiently catches up slow or recovering followers without needing a separate catch-up mechanism.
+
+**Prompt:** "Please explain how election_timeout_reset works?" and "Let's explore approach #2"
+
+**Event-Based Election Timeout Reset**
+
+Explored different approaches for resetting election timeouts when heartbeats arrive. Chose an event-based design where `handle_append_entries()` returns a `HandleAppendEntriesOutput` struct containing both the RPC result and a `RaftEvent` enum. When a valid AppendEntries is received (not stale term), it returns `RaftEvent::ResetElectionTimeout`. Added a `ServerEvent` channel so the transport layer can notify the server to reset its election deadline. The server loop uses `tokio::time::sleep_until()` with a deadline that gets pushed forward when reset events arrive.
+
+**Prompt:** "cool, now I want to test that RaftNode initiates election when election timeout passed"
+
+**Testing Election Timeout Behavior**
+
+Wrote integration tests for election timeout behavior. First test verifies that a follower automatically starts an election and becomes leader after the timeout expires. Second test verifies that a follower does NOT start an election before the timeout. Initially used real timing but this made tests slow and potentially flaky.
+
+**Prompt:** "messing with real timings can make tests flacky. Is there any way to avoid it?"
+
+**Deterministic Time Testing with Tokio**
+
+Refactored tests to use Tokio's time mocking instead of real delays. Added `test-util` feature to tokio dependency. Used `#[tokio::test(start_paused = true)]` to pause time at test start, then `tokio::time::advance()` to manually move time forward and `tokio::task::yield_now()` to let tasks run. Tests now run instantly regardless of configured timeout values, and are fully deterministic - no more flaky timing issues in CI.
+
 ---
 
 ## Notes
