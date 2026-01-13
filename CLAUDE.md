@@ -88,4 +88,5 @@ let (became_leader, _, _) = tokio::join!(
 
   <Change explanation>
   ```
-
+- Don't mention Claude in commit message
+- Always run tests wrapped with `timeout`
