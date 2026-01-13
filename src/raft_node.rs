@@ -396,4 +396,196 @@ mod tests {
         assert_eq!(shared2.lock().await.log[0].command, "SET x=1");
         assert_eq!(shared2.lock().await.log[1].command, "SET y=2");
     }
+
+    #[tokio::test]
+    async fn test_multiple_entries_replicated() {
+        let node_ids = vec![1, 2, 3];
+        let (mut transports, mut handles) = create_cluster(&node_ids);
+
+        let core1 = RaftCore::new(1, vec![2, 3]);
+        let core2 = RaftCore::new(2, vec![1, 3]);
+        let core3 = RaftCore::new(3, vec![1, 2]);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let node1 = RaftNode::new(core1, transport1);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Win election
+        node1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            node1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+
+        // Submit multiple commands
+        let entry3_index = {
+            let mut core = node1.core.lock().await;
+            core.append_log_entry("CMD 1".to_string()).unwrap();
+            core.append_log_entry("CMD 2".to_string()).unwrap();
+            core.append_log_entry("CMD 3".to_string()).unwrap().index
+        };
+
+        // Replicate all entries at once
+        let (_, _, _) = tokio::join!(
+            node1.replicate_to_peers(entry3_index),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+
+        // All entries should be replicated and committed
+        assert_eq!(node1.commit_index().await, entry3_index);
+        assert_eq!(shared2.lock().await.log.len(), 3);
+        assert_eq!(shared3.lock().await.log.len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_election_with_one_peer_timeout() {
+        use std::time::Duration;
+        use crate::transport_inmemory::create_cluster_with_timeout;
+
+        // In a 3-node cluster, need 2 votes (self + 1 peer)
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        let core1 = RaftCore::new(1, vec![2, 3]);
+        let core2 = RaftCore::new(2, vec![1, 3]);
+        // Node 3 won't respond (simulating crash/partition)
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let node1 = RaftNode::new(core1, transport1);
+        let shared2 = Arc::new(Mutex::new(core2));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+
+        node1.start_election().await;
+
+        // Only node 2 responds, node 3 times out
+        let (became_leader, _) = tokio::join!(
+            node1.request_votes(),
+            handle2.process_one_shared(&shared2),
+        );
+
+        // Should still become leader with self + node2 = majority
+        assert!(became_leader);
+        assert_eq!(node1.state().await, RaftState::Leader);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_replication_with_one_peer_timeout() {
+        use std::time::Duration;
+        use crate::transport_inmemory::create_cluster_with_timeout;
+
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        let core1 = RaftCore::new(1, vec![2, 3]);
+        let core2 = RaftCore::new(2, vec![1, 3]);
+        // Node 3 won't respond
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let node1 = RaftNode::new(core1, transport1);
+        let shared2 = Arc::new(Mutex::new(core2));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+
+        // Win election first
+        node1.start_election().await;
+        let (_, _) = tokio::join!(
+            node1.request_votes(),
+            handle2.process_one_shared(&shared2),
+        );
+        assert_eq!(node1.state().await, RaftState::Leader);
+
+        // Submit a command
+        let entry_index = {
+            let mut core = node1.core.lock().await;
+            core.append_log_entry("SET x=1".to_string()).unwrap().index
+        };
+
+        // Replicate - only node 2 responds, node 3 times out
+        let (_, _) = tokio::join!(
+            node1.replicate_to_peers(entry_index),
+            handle2.process_one_shared(&shared2),
+        );
+
+        // Entry should be committed (leader + node2 = majority)
+        assert_eq!(node1.commit_index().await, entry_index);
+        assert_eq!(shared2.lock().await.log.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_heartbeat_with_timeout() {
+        use std::time::Duration;
+        use crate::transport_inmemory::create_cluster_with_timeout;
+
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        let core1 = RaftCore::new(1, vec![2, 3]);
+        let core2 = RaftCore::new(2, vec![1, 3]);
+        let core3 = RaftCore::new(3, vec![1, 2]);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let node1 = RaftNode::new(core1, transport1);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Win election
+        node1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            node1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(node1.state().await, RaftState::Leader);
+
+        // Send heartbeat - node 3 doesn't respond (times out)
+        let (still_leader, _) = tokio::join!(
+            node1.send_heartbeat(),
+            handle2.process_one_shared(&shared2),
+            // handle3 not processed - times out
+        );
+
+        // Should still be leader
+        assert!(still_leader);
+        assert_eq!(node1.state().await, RaftState::Leader);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_all_peers_timeout_election_fails() {
+        use std::time::Duration;
+        use crate::transport_inmemory::create_cluster_with_timeout;
+
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, _handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        let core1 = RaftCore::new(1, vec![2, 3]);
+        let transport1 = transports.remove(&1).unwrap();
+        let node1 = RaftNode::new(core1, transport1);
+
+        node1.start_election().await;
+
+        // Neither peer responds - all timeout
+        let became_leader = node1.request_votes().await;
+
+        // Should not become leader (only has self-vote, need 2)
+        assert!(!became_leader);
+        assert_eq!(node1.state().await, RaftState::Candidate);
+    }
 }

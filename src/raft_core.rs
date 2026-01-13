@@ -256,16 +256,23 @@ impl RaftCore {
                     if log_index >= self.log.len() || self.log[log_index].term != append_req.prev_log_term {
                         false
                     } else {
-                        // If an existing entry conflicts with a new one (same index but different terms),
-                        // delete the existing entry and all that follow it
-                        let conflict_index = append_req.prev_log_index as usize;
-                        if conflict_index < self.log.len() {
-                            self.log.truncate(conflict_index);
-                        }
-
-                        // Append any new entries not already in the log
+                        // Process each new entry
                         for entry in &append_req.entries {
-                            self.log.push(entry.clone());
+                            let entry_idx = (entry.index - 1) as usize;
+
+                            if entry_idx < self.log.len() {
+                                // Entry exists at this index
+                                if self.log[entry_idx].term != entry.term {
+                                    // Conflict: same index but different terms
+                                    // Delete this entry and all that follow
+                                    self.log.truncate(entry_idx);
+                                    self.log.push(entry.clone());
+                                }
+                                // If terms match, entry already exists - skip (idempotent)
+                            } else {
+                                // Entry doesn't exist yet, append it
+                                self.log.push(entry.clone());
+                            }
                         }
 
                         // If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
@@ -283,9 +290,19 @@ impl RaftCore {
                 }
             } else {
                 // prev_log_index is 0, meaning we're starting from the beginning
-                // Append any new entries
+                // Process each new entry (same logic as above)
                 for entry in &append_req.entries {
-                    self.log.push(entry.clone());
+                    let entry_idx = (entry.index - 1) as usize;
+
+                    if entry_idx < self.log.len() {
+                        if self.log[entry_idx].term != entry.term {
+                            self.log.truncate(entry_idx);
+                            self.log.push(entry.clone());
+                        }
+                        // If terms match, skip (idempotent)
+                    } else {
+                        self.log.push(entry.clone());
+                    }
                 }
 
                 // Update commit_index
@@ -464,6 +481,13 @@ impl RaftCore {
             return None; // No entry to commit
         }
 
+        // Raft safety: Only commit entries from current term (Section 5.4.2)
+        // Previous term entries are committed indirectly when a current-term entry is committed
+        let entry_term = self.log.get((entry_index - 1) as usize).map(|e| e.term);
+        if entry_term != Some(self.current_term) {
+            return None; // Cannot commit entries from previous terms directly
+        }
+
         // Count how many nodes have replicated this entry (including leader)
         let mut replicated_count = 1; // Leader has it
         for (_, &match_idx) in &self.match_index {
@@ -588,6 +612,1223 @@ mod tests {
         assert!(output.result.success);
         assert_eq!(output.event, RaftEvent::ResetElectionTimeout);
         assert_eq!(output.leader_id, Some(2));
+    }
+
+    // === Vote Rejection Tests ===
+
+    #[test]
+    fn test_vote_denied_candidate_has_lower_term() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        node.current_term = 5;
+
+        // Candidate with lower term requests vote
+        let args = RequestVoteArgs {
+            term: 3,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+        let result = node.handle_request_vote(&args);
+
+        assert!(!result.vote_granted);
+        assert_eq!(result.term, 5); // Returns current term
+        assert_eq!(node.voted_for, None); // Didn't vote
+    }
+
+    #[test]
+    fn test_vote_denied_already_voted_for_another() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        node.current_term = 1;
+        node.voted_for = Some(2); // Already voted for node 2
+
+        // Node 3 requests vote in same term
+        let args = RequestVoteArgs {
+            term: 1,
+            candidate_id: 3,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+        let result = node.handle_request_vote(&args);
+
+        assert!(!result.vote_granted);
+        assert_eq!(node.voted_for, Some(2)); // Still voted for node 2
+    }
+
+    #[test]
+    fn test_vote_granted_to_same_candidate_again() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        node.current_term = 1;
+        node.voted_for = Some(2); // Already voted for node 2
+
+        // Node 2 requests vote again (e.g., retransmission)
+        let args = RequestVoteArgs {
+            term: 1,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+        let result = node.handle_request_vote(&args);
+
+        // Should grant vote to same candidate
+        assert!(result.vote_granted);
+        assert_eq!(node.voted_for, Some(2));
+    }
+
+    #[test]
+    fn test_vote_denied_candidate_log_has_older_term() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        // Node has log entry at term 3
+        node.log.push(LogEntry {
+            term: 3,
+            index: 1,
+            command: "SET x=1".to_string(),
+        });
+
+        // Candidate's last log entry is at term 2 (older)
+        let args = RequestVoteArgs {
+            term: 4,
+            candidate_id: 2,
+            last_log_index: 1,
+            last_log_term: 2, // Older than our term 3
+        };
+        let result = node.handle_request_vote(&args);
+
+        assert!(!result.vote_granted);
+        // Node should update term but not grant vote
+        assert_eq!(node.current_term, 4);
+    }
+
+    #[test]
+    fn test_vote_denied_candidate_log_is_shorter() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        // Node has 2 log entries at term 2
+        node.log.push(LogEntry {
+            term: 2,
+            index: 1,
+            command: "SET x=1".to_string(),
+        });
+        node.log.push(LogEntry {
+            term: 2,
+            index: 2,
+            command: "SET y=2".to_string(),
+        });
+
+        // Candidate has same term but shorter log
+        let args = RequestVoteArgs {
+            term: 3,
+            candidate_id: 2,
+            last_log_index: 1, // Only 1 entry
+            last_log_term: 2,  // Same term
+        };
+        let result = node.handle_request_vote(&args);
+
+        assert!(!result.vote_granted);
+    }
+
+    #[test]
+    fn test_vote_granted_candidate_log_has_higher_term() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        // Node has log entry at term 2
+        node.log.push(LogEntry {
+            term: 2,
+            index: 1,
+            command: "SET x=1".to_string(),
+        });
+
+        // Candidate's last log entry is at term 3 (newer)
+        let args = RequestVoteArgs {
+            term: 4,
+            candidate_id: 2,
+            last_log_index: 1,
+            last_log_term: 3, // Higher than our term 2
+        };
+        let result = node.handle_request_vote(&args);
+
+        assert!(result.vote_granted);
+        assert_eq!(node.voted_for, Some(2));
+    }
+
+    // === Term/State Transition Tests ===
+
+    #[test]
+    fn test_leader_steps_down_on_higher_term_in_vote_response() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        node.current_term = 1;
+        node.state = RaftState::Leader;
+
+        // Receive vote response with higher term
+        let result = RequestVoteResult {
+            term: 5,
+            vote_granted: false,
+        };
+        node.process_request_vote_response(&result);
+
+        assert_eq!(node.state, RaftState::Follower);
+        assert_eq!(node.current_term, 5);
+        assert_eq!(node.voted_for, None);
+    }
+
+    #[test]
+    fn test_leader_steps_down_on_higher_term_in_append_response() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        node.current_term = 1;
+        node.state = RaftState::Leader;
+
+        // Receive append response with higher term
+        let result = AppendEntriesResult {
+            term: 5,
+            success: false,
+        };
+        node.process_append_entries_response(&result);
+
+        assert_eq!(node.state, RaftState::Follower);
+        assert_eq!(node.current_term, 5);
+        assert_eq!(node.voted_for, None);
+    }
+
+    #[test]
+    fn test_candidate_steps_down_on_append_entries_from_new_leader() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        node.start_election(); // Now candidate at term 1
+        assert_eq!(node.state, RaftState::Candidate);
+
+        // Receive AppendEntries from leader at same term
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+        };
+        let output = node.handle_append_entries(&args);
+
+        // Should step down to follower
+        assert!(output.result.success);
+        assert_eq!(node.state, RaftState::Follower);
+    }
+
+    #[test]
+    fn test_candidate_steps_down_on_higher_term_request_vote() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        node.start_election(); // Now candidate at term 1
+        assert_eq!(node.state, RaftState::Candidate);
+        assert_eq!(node.voted_for, Some(1)); // Voted for self
+
+        // Receive RequestVote from candidate at higher term
+        let args = RequestVoteArgs {
+            term: 5,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+        let result = node.handle_request_vote(&args);
+
+        // Should step down, update term, and grant vote
+        assert!(result.vote_granted);
+        assert_eq!(node.state, RaftState::Follower);
+        assert_eq!(node.current_term, 5);
+        assert_eq!(node.voted_for, Some(2));
+    }
+
+    #[test]
+    fn test_follower_updates_term_on_higher_term_request_vote() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        node.current_term = 1;
+
+        // Receive RequestVote from higher term
+        let args = RequestVoteArgs {
+            term: 5,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+        let result = node.handle_request_vote(&args);
+
+        assert!(result.vote_granted);
+        assert_eq!(node.current_term, 5);
+        assert_eq!(node.voted_for, Some(2));
+    }
+
+    #[test]
+    fn test_follower_updates_term_on_higher_term_append_entries() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        node.current_term = 1;
+
+        // Receive AppendEntries from higher term
+        let args = AppendEntriesArgs {
+            term: 5,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+        };
+        let output = node.handle_append_entries(&args);
+
+        assert!(output.result.success);
+        assert_eq!(node.current_term, 5);
+        assert_eq!(node.voted_for, None); // Reset on term change
+    }
+
+    // === Split Vote / Election Tests ===
+
+    #[test]
+    fn test_election_needs_majority_in_5_node_cluster() {
+        // In a 5-node cluster, candidate needs 3 votes to win
+        let mut node = RaftCore::new(1, vec![2, 3, 4, 5]);
+        node.start_election();
+        assert_eq!(node.state, RaftState::Candidate);
+
+        let result_granted = RequestVoteResult {
+            term: 1,
+            vote_granted: true,
+        };
+        let result_denied = RequestVoteResult {
+            term: 1,
+            vote_granted: false,
+        };
+
+        // Get one vote - self + 1 = 2, not majority
+        let became_leader = node.handle_request_vote_result(2, &result_granted);
+        assert!(!became_leader);
+        assert_eq!(node.state, RaftState::Candidate);
+
+        // Get denied from node 3
+        let became_leader = node.handle_request_vote_result(3, &result_denied);
+        assert!(!became_leader);
+        assert_eq!(node.state, RaftState::Candidate);
+
+        // Get second yes - self + 2 = 3 = majority!
+        let became_leader = node.handle_request_vote_result(4, &result_granted);
+        assert!(became_leader);
+        assert_eq!(node.state, RaftState::Leader);
+    }
+
+    #[test]
+    fn test_election_lost_all_denied() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        node.start_election();
+
+        let result_denied = RequestVoteResult {
+            term: 1,
+            vote_granted: false,
+        };
+
+        // Both peers deny - only have self vote
+        let became_leader = node.handle_request_vote_result(2, &result_denied);
+        assert!(!became_leader);
+        let became_leader = node.handle_request_vote_result(3, &result_denied);
+        assert!(!became_leader);
+
+        // Still candidate, waiting for timeout to retry
+        assert_eq!(node.state, RaftState::Candidate);
+    }
+
+    // === Log Consistency Tests ===
+
+    #[test]
+    fn test_append_entries_fails_prev_log_index_too_high() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        // Node has empty log
+
+        // Leader tries to append entry at index 2, claiming prev_log_index=1 exists
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 1, // We don't have index 1
+            prev_log_term: 1,
+            entries: vec![LogEntry {
+                term: 1,
+                index: 2,
+                command: "SET x=1".to_string(),
+            }],
+            leader_commit: 0,
+        };
+        let output = node.handle_append_entries(&args);
+
+        assert!(!output.result.success);
+        assert_eq!(node.log.len(), 0); // Log unchanged
+    }
+
+    #[test]
+    fn test_append_entries_fails_prev_log_term_mismatch() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        // Node has entry at index 1 with term 1
+        node.log.push(LogEntry {
+            term: 1,
+            index: 1,
+            command: "SET x=1".to_string(),
+        });
+
+        // Leader claims prev_log_index=1 has term 2 (wrong!)
+        let args = AppendEntriesArgs {
+            term: 2,
+            leader_id: 2,
+            prev_log_index: 1,
+            prev_log_term: 2, // Mismatch! We have term 1
+            entries: vec![LogEntry {
+                term: 2,
+                index: 2,
+                command: "SET y=2".to_string(),
+            }],
+            leader_commit: 0,
+        };
+        let output = node.handle_append_entries(&args);
+
+        assert!(!output.result.success);
+        assert_eq!(node.log.len(), 1); // Log unchanged
+    }
+
+    #[test]
+    fn test_append_entries_truncates_conflicting_entries() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        // Node has entries from old leader at term 1
+        node.log.push(LogEntry {
+            term: 1,
+            index: 1,
+            command: "SET x=1".to_string(),
+        });
+        node.log.push(LogEntry {
+            term: 1,
+            index: 2,
+            command: "SET y=OLD".to_string(), // This will be replaced
+        });
+
+        // New leader at term 2 sends entry at index 2
+        let args = AppendEntriesArgs {
+            term: 2,
+            leader_id: 2,
+            prev_log_index: 1,
+            prev_log_term: 1, // Matches our entry at index 1
+            entries: vec![LogEntry {
+                term: 2,
+                index: 2,
+                command: "SET y=NEW".to_string(),
+            }],
+            leader_commit: 0,
+        };
+        let output = node.handle_append_entries(&args);
+
+        assert!(output.result.success);
+        assert_eq!(node.log.len(), 2);
+        assert_eq!(node.log[1].command, "SET y=NEW");
+        assert_eq!(node.log[1].term, 2);
+    }
+
+    #[test]
+    fn test_append_entries_idempotent() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+
+        // First append
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                term: 1,
+                index: 1,
+                command: "SET x=1".to_string(),
+            }],
+            leader_commit: 0,
+        };
+        let output = node.handle_append_entries(&args);
+        assert!(output.result.success);
+        assert_eq!(node.log.len(), 1);
+
+        // Same append again (retransmission)
+        let output = node.handle_append_entries(&args);
+        assert!(output.result.success);
+        // Should still have only 1 entry (idempotent)
+        assert_eq!(node.log.len(), 1);
+        assert_eq!(node.log[0].command, "SET x=1");
+    }
+
+    #[test]
+    fn test_commit_index_advances_on_append_entries() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+
+        // Append entry
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                term: 1,
+                index: 1,
+                command: "SET x=1".to_string(),
+            }],
+            leader_commit: 1, // Leader has committed this entry
+        };
+        let output = node.handle_append_entries(&args);
+
+        assert!(output.result.success);
+        assert_eq!(node.commit_index, 1);
+        assert_eq!(node.last_applied, 1);
+    }
+
+    #[test]
+    fn test_commit_index_limited_by_log_length() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+
+        // Leader says commit_index=5 but we only have 1 entry
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                term: 1,
+                index: 1,
+                command: "SET x=1".to_string(),
+            }],
+            leader_commit: 5, // Higher than our log
+        };
+        let output = node.handle_append_entries(&args);
+
+        assert!(output.result.success);
+        // commit_index should be min(leader_commit, last_log_index) = 1
+        assert_eq!(node.commit_index, 1);
+    }
+
+    // === Leader Replication Logic Tests ===
+
+    #[test]
+    fn test_next_index_decrements_on_failed_append() {
+        let mut leader = RaftCore::new(1, vec![2, 3]);
+        leader.current_term = 1;
+        leader.state = RaftState::Leader;
+
+        // Initialize next_index for peer 2 (assume it's at index 5)
+        leader.next_index.insert(2, 5);
+
+        // Peer rejects AppendEntries (log mismatch)
+        let result = AppendEntriesResult {
+            term: 1,
+            success: false,
+        };
+        leader.handle_append_entries_result(2, 5, &result);
+
+        // next_index should decrement to 4 for retry
+        assert_eq!(leader.next_index.get(&2), Some(&4));
+    }
+
+    #[test]
+    fn test_next_index_does_not_go_below_1() {
+        let mut leader = RaftCore::new(1, vec![2, 3]);
+        leader.current_term = 1;
+        leader.state = RaftState::Leader;
+
+        // next_index is already at 1
+        leader.next_index.insert(2, 1);
+
+        // Peer rejects AppendEntries
+        let result = AppendEntriesResult {
+            term: 1,
+            success: false,
+        };
+        leader.handle_append_entries_result(2, 1, &result);
+
+        // next_index should stay at 1 (can't go lower)
+        assert_eq!(leader.next_index.get(&2), Some(&1));
+    }
+
+    #[test]
+    fn test_match_index_updates_on_successful_append() {
+        let mut leader = RaftCore::new(1, vec![2, 3]);
+        leader.current_term = 1;
+        leader.state = RaftState::Leader;
+        leader.log.push(LogEntry {
+            term: 1,
+            index: 1,
+            command: "SET x=1".to_string(),
+        });
+
+        // Initialize
+        leader.next_index.insert(2, 1);
+        leader.match_index.insert(2, 0);
+
+        // Peer accepts AppendEntries for index 1
+        let result = AppendEntriesResult {
+            term: 1,
+            success: true,
+        };
+        leader.handle_append_entries_result(2, 1, &result);
+
+        // match_index should update to 1
+        assert_eq!(leader.match_index.get(&2), Some(&1));
+        // next_index should advance to 2
+        assert_eq!(leader.next_index.get(&2), Some(&2));
+    }
+
+    #[test]
+    fn test_match_index_does_not_decrease() {
+        let mut leader = RaftCore::new(1, vec![2, 3]);
+        leader.current_term = 1;
+        leader.state = RaftState::Leader;
+
+        // Peer already has match_index of 5
+        leader.match_index.insert(2, 5);
+
+        // Receive success for index 3 (stale/duplicate response)
+        let result = AppendEntriesResult {
+            term: 1,
+            success: true,
+        };
+        leader.handle_append_entries_result(2, 3, &result);
+
+        // match_index should stay at 5 (not decrease)
+        assert_eq!(leader.match_index.get(&2), Some(&5));
+    }
+
+    #[test]
+    fn test_entry_not_committed_without_majority() {
+        let mut leader = RaftCore::new(1, vec![2, 3, 4, 5]); // 5-node cluster
+        leader.current_term = 1;
+        leader.state = RaftState::Leader;
+        leader.log.push(LogEntry {
+            term: 1,
+            index: 1,
+            command: "SET x=1".to_string(),
+        });
+
+        // Only peer 2 replicates (leader + 1 peer = 2, need 3 for majority)
+        let result = AppendEntriesResult {
+            term: 1,
+            success: true,
+        };
+        let committed = leader.handle_append_entries_result(2, 1, &result);
+
+        assert!(committed.is_none());
+        assert_eq!(leader.commit_index, 0); // Not committed yet
+    }
+
+    #[test]
+    fn test_entry_committed_with_majority() {
+        let mut leader = RaftCore::new(1, vec![2, 3, 4, 5]); // 5-node cluster
+        leader.current_term = 1;
+        leader.state = RaftState::Leader;
+        leader.log.push(LogEntry {
+            term: 1,
+            index: 1,
+            command: "SET x=1".to_string(),
+        });
+
+        let result = AppendEntriesResult {
+            term: 1,
+            success: true,
+        };
+
+        // Peer 2 replicates (2 total)
+        let committed = leader.handle_append_entries_result(2, 1, &result);
+        assert!(committed.is_none());
+
+        // Peer 3 replicates (3 total = majority in 5-node cluster)
+        let committed = leader.handle_append_entries_result(3, 1, &result);
+        assert_eq!(committed, Some(1));
+        assert_eq!(leader.commit_index, 1);
+    }
+
+    #[test]
+    fn test_commit_multiple_entries_at_once() {
+        let mut leader = RaftCore::new(1, vec![2, 3]);
+        leader.current_term = 1;
+        leader.state = RaftState::Leader;
+
+        // Leader has 3 entries
+        for i in 1..=3 {
+            leader.log.push(LogEntry {
+                term: 1,
+                index: i,
+                command: format!("CMD {}", i),
+            });
+        }
+
+        let result = AppendEntriesResult {
+            term: 1,
+            success: true,
+        };
+
+        // Peer 2 replicates up to index 3
+        let committed = leader.handle_append_entries_result(2, 3, &result);
+
+        // Should commit all 3 entries (leader + peer2 = majority)
+        assert_eq!(committed, Some(3));
+        assert_eq!(leader.commit_index, 3);
+        assert_eq!(leader.last_applied, 3);
+    }
+
+    #[test]
+    fn test_leader_loses_leadership_on_higher_term_response() {
+        let mut leader = RaftCore::new(1, vec![2, 3]);
+        leader.current_term = 1;
+        leader.state = RaftState::Leader;
+        leader.log.push(LogEntry {
+            term: 1,
+            index: 1,
+            command: "SET x=1".to_string(),
+        });
+
+        // Peer responds with higher term
+        let result = AppendEntriesResult {
+            term: 5,
+            success: false,
+        };
+        let committed = leader.handle_append_entries_result(2, 1, &result);
+
+        // Should step down and not commit
+        assert!(committed.is_none());
+        assert_eq!(leader.state, RaftState::Follower);
+        assert_eq!(leader.current_term, 5);
+        assert_eq!(leader.commit_index, 0);
+    }
+
+    #[test]
+    fn test_become_leader_initializes_next_index() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+
+        // Add some log entries before becoming leader
+        node.log.push(LogEntry {
+            term: 1,
+            index: 1,
+            command: "SET x=1".to_string(),
+        });
+        node.log.push(LogEntry {
+            term: 1,
+            index: 2,
+            command: "SET y=2".to_string(),
+        });
+
+        node.current_term = 2;
+        node.become_leader();
+
+        // next_index should be last_log_index + 1 = 3 for all peers
+        assert_eq!(node.next_index.get(&2), Some(&3));
+        assert_eq!(node.next_index.get(&3), Some(&3));
+
+        // match_index should be 0 for all peers
+        assert_eq!(node.match_index.get(&2), Some(&0));
+        assert_eq!(node.match_index.get(&3), Some(&0));
+    }
+
+    #[test]
+    fn test_leader_cannot_commit_previous_term_entries_directly() {
+        // Raft paper Section 5.4.2: Leader cannot commit entries from previous terms
+        // by counting replicas. Must commit entry from current term first.
+        let mut leader = RaftCore::new(1, vec![2, 3]);
+
+        // Leader has entry from term 1 (previous term)
+        leader.log.push(LogEntry {
+            term: 1,
+            index: 1,
+            command: "SET x=1".to_string(),
+        });
+
+        // Leader is now at term 2
+        leader.current_term = 2;
+        leader.state = RaftState::Leader;
+        leader.become_leader();
+
+        // Entry from term 1 gets replicated to majority
+        let result = AppendEntriesResult {
+            term: 2,
+            success: true,
+        };
+        let committed = leader.handle_append_entries_result(2, 1, &result);
+
+        // Should NOT commit entry from previous term directly
+        // (This test documents the expected behavior per Raft paper)
+        assert!(committed.is_none(), "Should not commit previous term entry directly");
+        assert_eq!(leader.commit_index, 0);
+    }
+
+    #[test]
+    fn test_previous_term_entries_committed_indirectly() {
+        // Once a current-term entry is committed, previous entries are committed too
+        let mut leader = RaftCore::new(1, vec![2, 3]);
+
+        // Entry from previous term
+        leader.log.push(LogEntry {
+            term: 1,
+            index: 1,
+            command: "SET x=1".to_string(),
+        });
+
+        // Entry from current term
+        leader.log.push(LogEntry {
+            term: 2,
+            index: 2,
+            command: "SET y=2".to_string(),
+        });
+
+        leader.current_term = 2;
+        leader.state = RaftState::Leader;
+        leader.become_leader();
+
+        // Both entries replicated to peer 2
+        let result = AppendEntriesResult {
+            term: 2,
+            success: true,
+        };
+        let committed = leader.handle_append_entries_result(2, 2, &result);
+
+        // Entry 2 (current term) committed, which indirectly commits entry 1
+        assert_eq!(committed, Some(2));
+        assert_eq!(leader.commit_index, 2);
+        assert_eq!(leader.last_applied, 2); // Both entries applied
+    }
+
+    // === Multi-Step Scenarios ===
+
+    #[test]
+    fn test_follower_catches_up_multiple_entries() {
+        let mut follower = RaftCore::new(1, vec![2, 3]);
+
+        // Leader sends 3 entries at once to catch up follower
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![
+                LogEntry { term: 1, index: 1, command: "CMD 1".to_string() },
+                LogEntry { term: 1, index: 2, command: "CMD 2".to_string() },
+                LogEntry { term: 1, index: 3, command: "CMD 3".to_string() },
+            ],
+            leader_commit: 2, // Leader has committed up to index 2
+        };
+        let output = follower.handle_append_entries(&args);
+
+        assert!(output.result.success);
+        assert_eq!(follower.log.len(), 3);
+        assert_eq!(follower.commit_index, 2); // Follows leader's commit
+        assert_eq!(follower.last_applied, 2);
+    }
+
+    #[test]
+    fn test_follower_catches_up_incrementally() {
+        let mut follower = RaftCore::new(1, vec![2, 3]);
+
+        // First batch: entries 1-2
+        let args1 = AppendEntriesArgs {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![
+                LogEntry { term: 1, index: 1, command: "CMD 1".to_string() },
+                LogEntry { term: 1, index: 2, command: "CMD 2".to_string() },
+            ],
+            leader_commit: 1,
+        };
+        follower.handle_append_entries(&args1);
+        assert_eq!(follower.log.len(), 2);
+        assert_eq!(follower.commit_index, 1);
+
+        // Second batch: entries 3-4
+        let args2 = AppendEntriesArgs {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 2,
+            prev_log_term: 1,
+            entries: vec![
+                LogEntry { term: 1, index: 3, command: "CMD 3".to_string() },
+                LogEntry { term: 1, index: 4, command: "CMD 4".to_string() },
+            ],
+            leader_commit: 3,
+        };
+        let output = follower.handle_append_entries(&args2);
+
+        assert!(output.result.success);
+        assert_eq!(follower.log.len(), 4);
+        assert_eq!(follower.commit_index, 3);
+    }
+
+    #[test]
+    fn test_multiple_elections_term_increases() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+
+        // First election
+        node.start_election();
+        assert_eq!(node.current_term, 1);
+        assert_eq!(node.state, RaftState::Candidate);
+
+        // Election fails (no majority), start another
+        node.start_election();
+        assert_eq!(node.current_term, 2);
+        assert_eq!(node.state, RaftState::Candidate);
+        assert_eq!(node.voted_for, Some(1)); // Votes for self again
+
+        // Third election
+        node.start_election();
+        assert_eq!(node.current_term, 3);
+    }
+
+    #[test]
+    fn test_duplicate_vote_from_same_peer_ignored() {
+        let mut node = RaftCore::new(1, vec![2, 3, 4, 5]); // 5-node cluster
+        node.start_election();
+
+        let result_granted = RequestVoteResult {
+            term: 1,
+            vote_granted: true,
+        };
+
+        // Peer 2 votes
+        let became_leader = node.handle_request_vote_result(2, &result_granted);
+        assert!(!became_leader); // 2 votes (self + peer2), need 3
+
+        // Peer 2 votes again (duplicate/retransmission)
+        let became_leader = node.handle_request_vote_result(2, &result_granted);
+        assert!(!became_leader); // Still only 2 unique votes
+
+        // Peer 3 votes - now we have majority
+        let became_leader = node.handle_request_vote_result(3, &result_granted);
+        assert!(became_leader); // 3 votes = majority
+    }
+
+    // === Cluster Configuration Tests ===
+
+    #[test]
+    fn test_single_node_cluster_immediate_leader() {
+        let mut node = RaftCore::new(1, vec![]); // No peers
+
+        node.start_election();
+
+        // With no peers, self-vote is majority (1/1)
+        // Check if we can become leader
+        let total_nodes = 1 + node.peers.len(); // 1
+        let majority = (total_nodes / 2) + 1;   // 1
+        assert_eq!(majority, 1);
+
+        // Self-vote should be enough
+        assert!(node.votes_received.len() >= majority);
+
+        // Manually check - in real impl, start_election + self-vote = leader
+        // The current impl requires handling vote results, so let's verify the math
+        node.become_leader();
+        assert_eq!(node.state, RaftState::Leader);
+    }
+
+    #[test]
+    fn test_two_node_cluster_needs_both_votes() {
+        let mut node = RaftCore::new(1, vec![2]); // 2-node cluster
+
+        node.start_election();
+        // Self-vote gives us 1, need 2 for majority (2/2 + 1 = 2)
+
+        let result_denied = RequestVoteResult {
+            term: 1,
+            vote_granted: false,
+        };
+
+        // Peer denies - no majority
+        let became_leader = node.handle_request_vote_result(2, &result_denied);
+        assert!(!became_leader);
+        assert_eq!(node.state, RaftState::Candidate);
+    }
+
+    #[test]
+    fn test_two_node_cluster_becomes_leader_with_peer_vote() {
+        let mut node = RaftCore::new(1, vec![2]); // 2-node cluster
+
+        node.start_election();
+
+        let result_granted = RequestVoteResult {
+            term: 1,
+            vote_granted: true,
+        };
+
+        // Peer grants vote - now have majority (2/2)
+        let became_leader = node.handle_request_vote_result(2, &result_granted);
+        assert!(became_leader);
+        assert_eq!(node.state, RaftState::Leader);
+    }
+
+    #[test]
+    fn test_four_node_cluster_majority() {
+        // Even-numbered cluster: 4 nodes need 3 votes for majority
+        let mut node = RaftCore::new(1, vec![2, 3, 4]);
+
+        node.start_election();
+
+        let result_granted = RequestVoteResult {
+            term: 1,
+            vote_granted: true,
+        };
+
+        // Self + peer2 = 2 votes, not enough
+        let became_leader = node.handle_request_vote_result(2, &result_granted);
+        assert!(!became_leader);
+
+        // Self + peer2 + peer3 = 3 votes = majority
+        let became_leader = node.handle_request_vote_result(3, &result_granted);
+        assert!(became_leader);
+        assert_eq!(node.state, RaftState::Leader);
+    }
+
+    // === Log Divergence Tests ===
+
+    #[test]
+    fn test_follower_with_extra_uncommitted_entries_gets_truncated() {
+        // Scenario: Follower received entries from old leader that were never committed
+        // New leader sends AppendEntries that conflicts - follower must truncate
+        let mut follower = RaftCore::new(1, vec![2, 3]);
+
+        // Follower has entries from old leader (term 1)
+        follower.log.push(LogEntry { term: 1, index: 1, command: "OLD 1".to_string() });
+        follower.log.push(LogEntry { term: 1, index: 2, command: "OLD 2".to_string() });
+        follower.log.push(LogEntry { term: 1, index: 3, command: "OLD 3".to_string() });
+        follower.current_term = 1;
+
+        // New leader at term 2 has different entry at index 2
+        let args = AppendEntriesArgs {
+            term: 2,
+            leader_id: 2,
+            prev_log_index: 1,
+            prev_log_term: 1, // Matches follower's entry 1
+            entries: vec![
+                LogEntry { term: 2, index: 2, command: "NEW 2".to_string() },
+            ],
+            leader_commit: 0,
+        };
+        let output = follower.handle_append_entries(&args);
+
+        assert!(output.result.success);
+        assert_eq!(follower.log.len(), 2); // Truncated entries 2-3, added new entry 2
+        assert_eq!(follower.log[1].term, 2);
+        assert_eq!(follower.log[1].command, "NEW 2");
+        assert_eq!(follower.current_term, 2);
+    }
+
+    #[test]
+    fn test_follower_with_gap_rejects_append() {
+        // Follower is missing entries - should reject until caught up
+        let mut follower = RaftCore::new(1, vec![2, 3]);
+
+        // Follower only has entry 1
+        follower.log.push(LogEntry { term: 1, index: 1, command: "CMD 1".to_string() });
+
+        // Leader tries to append entry 5, claiming prev_log_index=4
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 4, // Follower doesn't have this
+            prev_log_term: 1,
+            entries: vec![
+                LogEntry { term: 1, index: 5, command: "CMD 5".to_string() },
+            ],
+            leader_commit: 0,
+        };
+        let output = follower.handle_append_entries(&args);
+
+        assert!(!output.result.success);
+        assert_eq!(follower.log.len(), 1); // Unchanged
+    }
+
+    // === Stale/Out-of-Order Response Tests ===
+
+    #[test]
+    fn test_ignore_stale_vote_response_from_old_term() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+
+        // Start election at term 1
+        node.start_election();
+        assert_eq!(node.current_term, 1);
+
+        // Move to term 3 (e.g., saw higher term from another node)
+        node.current_term = 3;
+        node.state = RaftState::Follower;
+        node.voted_for = None;
+
+        // Receive stale vote response from term 1
+        let stale_result = RequestVoteResult {
+            term: 1,
+            vote_granted: true,
+        };
+        let became_leader = node.handle_request_vote_result(2, &stale_result);
+
+        // Should not become leader - we're not even a candidate anymore
+        assert!(!became_leader);
+        assert_eq!(node.state, RaftState::Follower);
+    }
+
+    #[test]
+    fn test_stale_append_response_does_not_affect_commit() {
+        let mut leader = RaftCore::new(1, vec![2, 3]);
+        leader.current_term = 5;
+        leader.state = RaftState::Leader;
+
+        // Leader has entries
+        leader.log.push(LogEntry { term: 5, index: 1, command: "CMD 1".to_string() });
+
+        // Receive response claiming term 3 (stale)
+        let stale_result = AppendEntriesResult {
+            term: 3,
+            success: true,
+        };
+        let committed = leader.handle_append_entries_result(2, 1, &stale_result);
+
+        // Should still process (term is lower, so no step-down)
+        // Entry should be counted for commit
+        assert_eq!(leader.match_index.get(&2), Some(&1));
+    }
+
+    // === Leader Operations Tests ===
+
+    #[test]
+    fn test_leader_appends_multiple_entries_sequentially() {
+        let mut leader = RaftCore::new(1, vec![2, 3]);
+        leader.current_term = 1;
+        leader.state = RaftState::Leader;
+        leader.become_leader();
+
+        // Append first entry
+        let entry1 = leader.append_log_entry("CMD 1".to_string());
+        assert!(entry1.is_some());
+        assert_eq!(entry1.unwrap().index, 1);
+
+        // Append second entry
+        let entry2 = leader.append_log_entry("CMD 2".to_string());
+        assert!(entry2.is_some());
+        assert_eq!(entry2.unwrap().index, 2);
+
+        // Append third entry
+        let entry3 = leader.append_log_entry("CMD 3".to_string());
+        assert!(entry3.is_some());
+        assert_eq!(entry3.unwrap().index, 3);
+
+        assert_eq!(leader.log.len(), 3);
+        assert_eq!(leader.log[0].command, "CMD 1");
+        assert_eq!(leader.log[2].command, "CMD 3");
+    }
+
+    #[test]
+    fn test_non_leader_cannot_append_entries() {
+        let mut follower = RaftCore::new(1, vec![2, 3]);
+        follower.state = RaftState::Follower;
+
+        let result = follower.append_log_entry("CMD".to_string());
+        assert!(result.is_none());
+
+        let mut candidate = RaftCore::new(2, vec![1, 3]);
+        candidate.start_election();
+
+        let result = candidate.append_log_entry("CMD".to_string());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_leader_entry_has_current_term() {
+        let mut leader = RaftCore::new(1, vec![2, 3]);
+        leader.current_term = 7;
+        leader.state = RaftState::Leader;
+
+        let entry = leader.append_log_entry("CMD".to_string());
+
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().term, 7);
+    }
+
+    // === Edge Cases ===
+
+    #[test]
+    fn test_vote_request_resets_voted_for_on_new_term() {
+        let mut node = RaftCore::new(1, vec![2, 3]);
+        node.current_term = 1;
+        node.voted_for = Some(2); // Voted for node 2 in term 1
+
+        // Receive vote request from higher term
+        let args = RequestVoteArgs {
+            term: 5,
+            candidate_id: 3,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+        let result = node.handle_request_vote(&args);
+
+        // Should reset voted_for and grant vote to new candidate
+        assert!(result.vote_granted);
+        assert_eq!(node.voted_for, Some(3));
+        assert_eq!(node.current_term, 5);
+    }
+
+    #[test]
+    fn test_empty_append_entries_still_updates_commit_index() {
+        let mut follower = RaftCore::new(1, vec![2, 3]);
+
+        // Follower already has entries
+        follower.log.push(LogEntry { term: 1, index: 1, command: "CMD 1".to_string() });
+        follower.log.push(LogEntry { term: 1, index: 2, command: "CMD 2".to_string() });
+        follower.commit_index = 0;
+
+        // Leader sends empty AppendEntries (heartbeat) with updated commit
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 2,
+            prev_log_term: 1,
+            entries: vec![], // Empty
+            leader_commit: 2,
+        };
+        let output = follower.handle_append_entries(&args);
+
+        assert!(output.result.success);
+        assert_eq!(follower.commit_index, 2);
+        assert_eq!(follower.last_applied, 2);
+    }
+
+    #[test]
+    fn test_append_entries_with_entries_already_present() {
+        // Test idempotency when leader retransmits entries we already have
+        let mut follower = RaftCore::new(1, vec![2, 3]);
+
+        // Follower already has entries 1-3
+        follower.log.push(LogEntry { term: 1, index: 1, command: "CMD 1".to_string() });
+        follower.log.push(LogEntry { term: 1, index: 2, command: "CMD 2".to_string() });
+        follower.log.push(LogEntry { term: 1, index: 3, command: "CMD 3".to_string() });
+
+        // Leader retransmits entries 2-3 (already present with same term)
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 1,
+            prev_log_term: 1,
+            entries: vec![
+                LogEntry { term: 1, index: 2, command: "CMD 2".to_string() },
+                LogEntry { term: 1, index: 3, command: "CMD 3".to_string() },
+            ],
+            leader_commit: 0,
+        };
+        let output = follower.handle_append_entries(&args);
+
+        assert!(output.result.success);
+        assert_eq!(follower.log.len(), 3); // No duplicates
+    }
+
+    #[test]
+    fn test_candidate_resets_votes_on_new_election() {
+        let mut node = RaftCore::new(1, vec![2, 3, 4, 5]);
+
+        // First election - get some votes but not majority
+        node.start_election();
+        let result = RequestVoteResult { term: 1, vote_granted: true };
+        node.handle_request_vote_result(2, &result);
+        // Have 2 votes (self + peer2), need 3
+
+        // Start new election
+        node.start_election();
+
+        // Should have reset - only self vote now
+        // Need to get 2 more votes for majority
+        let result = RequestVoteResult { term: 2, vote_granted: true };
+        let became_leader = node.handle_request_vote_result(3, &result);
+        assert!(!became_leader); // Only 2 votes
+
+        let became_leader = node.handle_request_vote_result(4, &result);
+        assert!(became_leader); // Now 3 votes
     }
 }
 

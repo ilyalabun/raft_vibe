@@ -169,6 +169,32 @@ Wrote integration tests for election timeout behavior. First test verifies that 
 
 Refactored tests to use Tokio's time mocking instead of real delays. Added `test-util` feature to tokio dependency. Used `#[tokio::test(start_paused = true)]` to pause time at test start, then `tokio::time::advance()` to manually move time forward and `tokio::task::yield_now()` to let tasks run. Tests now run instantly regardless of configured timeout values, and are fully deterministic - no more flaky timing issues in CI.
 
+## Day 6: Comprehensive Test Coverage
+
+**Prompt:** "Let's analyze more test cases and write more tests"
+
+**Expanding Test Coverage**
+
+Added extensive tests to cover edge cases and failure scenarios. Wrote tests for vote rejection (candidate with lower term, already voted, shorter log), term/state transitions (follower updates term, candidate steps down), and leader replication logic (next_index, match_index, majority commit). Fixed two bugs discovered during testing: AppendEntries wasn't idempotent (duplicate entries were appended), and the leader could commit previous-term entries directly (violating Raft Section 5.4.2 safety property).
+
+**Prompt:** "let's add timeouts to tests"
+
+**Adding Timeout Support to Transport**
+
+Extended the in-memory transport with timeout support for more realistic testing. Added `InMemoryTransport::with_timeout()` and `create_cluster_with_timeout()` helpers. Tests can now simulate network delays and partial responses. Used `#[tokio::test(start_paused = true)]` with `tokio::time::advance()` for deterministic timing without real delays.
+
+**Prompt:** "let's do RaftServer and network partition tests"
+
+**Network Partition and Client Command Tests**
+
+Added integration tests for RaftServer covering the full client command flow (submit → replicate → commit), multiple commands in sequence, leader failover, leader isolated from majority, split-brain prevention, partitioned node rejoining, and stale leader stepping down. Learned the pattern for testing with spawned tasks and paused time: spawn both the submit task and peer handlers, then advance time in a loop to let all tasks make progress.
+
+**Prompt:** "let's cover candidate rejects commands and command fails mid-replication"
+
+**Final Edge Case Tests**
+
+Added tests verifying that candidates reject client commands (not just followers), and that commands fail properly when a leader loses leadership mid-operation (e.g., sees a higher term during replication). Test suite now has 86 tests covering core Raft logic, async operations, and failure scenarios.
+
 ---
 
 ## Notes
