@@ -7,18 +7,21 @@ mod config;
 mod raft_node;
 mod raft_core;
 mod raft_server;
+mod storage;
+mod storage_memory;
 mod transport;
 mod transport_inmemory;
 
 use raft_core::{RaftCore, RequestVoteArgs, AppendEntriesArgs};
+use storage_memory::MemoryStorage;
 
 fn main() {
     println!("=== Raft Consensus Algorithm Demo ===\n");
 
     // Create three nodes in a cluster
-    let mut node1 = RaftCore::new(1, vec![2, 3]);
-    let mut node2 = RaftCore::new(2, vec![1, 3]);
-    let mut node3 = RaftCore::new(3, vec![1, 2]);
+    let mut node1 = RaftCore::new(1, vec![2, 3], Box::new(MemoryStorage::new()));
+    let mut node2 = RaftCore::new(2, vec![1, 3], Box::new(MemoryStorage::new()));
+    let mut node3 = RaftCore::new(3, vec![1, 2], Box::new(MemoryStorage::new()));
 
     println!("Created 3-node cluster:");
     println!("  Node 1: {:?}", node1.state);

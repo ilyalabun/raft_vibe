@@ -185,13 +185,19 @@ pub fn create_cluster_with_timeout(
 mod tests {
     use super::*;
     use crate::raft_core::RaftCore;
+    use crate::storage_memory::MemoryStorage;
+
+    /// Helper to create RaftCore with MemoryStorage for tests
+    fn new_test_core(id: u64, peers: Vec<u64>) -> RaftCore {
+        RaftCore::new(id, peers, Box::new(MemoryStorage::new()))
+    }
 
     #[tokio::test]
     async fn test_request_vote() {
         let node_ids = vec![1, 2, 3];
         let (transports, mut handles) = create_cluster(&node_ids);
 
-        let mut node2 = RaftCore::new(2, vec![1, 3]);
+        let mut node2 = new_test_core(2, vec![1, 3]);
 
         // Node 1 requests vote from node 2
         let transport1 = transports.get(&1).unwrap();
@@ -219,7 +225,7 @@ mod tests {
         let node_ids = vec![1, 2, 3];
         let (transports, mut handles) = create_cluster(&node_ids);
 
-        let mut node2 = RaftCore::new(2, vec![1, 3]);
+        let mut node2 = new_test_core(2, vec![1, 3]);
 
         // Node 1 sends append entries to node 2
         let transport1 = transports.get(&1).unwrap();
@@ -266,9 +272,9 @@ mod tests {
         let node_ids = vec![1, 2, 3];
         let (transports, mut handles) = create_cluster(&node_ids);
 
-        let mut node1 = RaftCore::new(1, vec![2, 3]);
-        let mut node2 = RaftCore::new(2, vec![1, 3]);
-        let mut node3 = RaftCore::new(3, vec![1, 2]);
+        let mut node1 = new_test_core(1, vec![2, 3]);
+        let mut node2 = new_test_core(2, vec![1, 3]);
+        let mut node3 = new_test_core(3, vec![1, 2]);
 
         // Node 1 starts election
         node1.start_election();
@@ -355,7 +361,7 @@ mod tests {
         let timeout = Duration::from_millis(100);
         let (transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
 
-        let mut node2 = RaftCore::new(2, vec![1, 3]);
+        let mut node2 = new_test_core(2, vec![1, 3]);
         // Node 3 won't respond
 
         let transport1 = transports.get(&1).unwrap();

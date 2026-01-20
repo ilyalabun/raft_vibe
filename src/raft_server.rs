@@ -210,14 +210,20 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Mutex;
     use crate::config::RaftConfig;
+    use crate::storage_memory::MemoryStorage;
     use crate::transport_inmemory::create_cluster;
+
+    /// Helper to create RaftCore with MemoryStorage for tests
+    fn new_test_core(id: u64, peers: Vec<u64>) -> RaftCore {
+        RaftCore::new(id, peers, Box::new(MemoryStorage::new()))
+    }
 
     #[tokio::test]
     async fn test_server_not_leader() {
         let node_ids = vec![1, 2, 3];
         let (mut transports, _handles) = create_cluster(&node_ids);
 
-        let core1 = RaftCore::new(1, vec![2, 3]);
+        let core1 = new_test_core(1, vec![2, 3]);
         let transport1 = transports.remove(&1).unwrap();
 
         let (server, _shared_core, _event_tx) = RaftServer::new(core1, transport1);
@@ -233,9 +239,9 @@ mod tests {
         let node_ids = vec![1, 2, 3];
         let (mut transports, mut handles) = create_cluster(&node_ids);
 
-        let core1 = RaftCore::new(1, vec![2, 3]);
-        let core2 = RaftCore::new(2, vec![1, 3]);
-        let core3 = RaftCore::new(3, vec![1, 2]);
+        let core1 = new_test_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
 
         let transport1 = transports.remove(&1).unwrap();
 
@@ -265,9 +271,9 @@ mod tests {
         let node_ids = vec![1, 2, 3];
         let (mut transports, mut handles) = create_cluster(&node_ids);
 
-        let core1 = RaftCore::new(1, vec![2, 3]);
-        let core2 = RaftCore::new(2, vec![1, 3]);
-        let core3 = RaftCore::new(3, vec![1, 2]);
+        let core1 = new_test_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
 
         let transport1 = transports.remove(&1).unwrap();
 
@@ -312,9 +318,9 @@ mod tests {
         let node_ids = vec![1, 2, 3];
         let (mut transports, mut handles) = create_cluster(&node_ids);
 
-        let core1 = RaftCore::new(1, vec![2, 3]);
-        let core2 = RaftCore::new(2, vec![1, 3]);
-        let core3 = RaftCore::new(3, vec![1, 2]);
+        let core1 = new_test_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
 
         let transport1 = transports.remove(&1).unwrap();
 
@@ -368,7 +374,7 @@ mod tests {
         let node_ids = vec![1, 2, 3];
         let (mut transports, _handles) = create_cluster(&node_ids);
 
-        let core1 = RaftCore::new(1, vec![2, 3]);
+        let core1 = new_test_core(1, vec![2, 3]);
         let transport1 = transports.remove(&1).unwrap();
 
         let config = RaftConfig::default()
@@ -408,9 +414,9 @@ mod tests {
         let timeout = Duration::from_millis(100);
         let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
 
-        let core1 = RaftCore::new(1, vec![2, 3]);
-        let core2 = RaftCore::new(2, vec![1, 3]);
-        let core3 = RaftCore::new(3, vec![1, 2]);
+        let core1 = new_test_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
 
         let transport1 = transports.remove(&1).unwrap();
 
@@ -484,9 +490,9 @@ mod tests {
         let timeout = Duration::from_millis(100);
         let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
 
-        let core1 = RaftCore::new(1, vec![2, 3]);
-        let core2 = RaftCore::new(2, vec![1, 3]);
-        let core3 = RaftCore::new(3, vec![1, 2]);
+        let core1 = new_test_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
 
         let transport1 = transports.remove(&1).unwrap();
 
@@ -561,9 +567,9 @@ mod tests {
         let timeout = Duration::from_millis(100);
         let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
 
-        let core1 = RaftCore::new(1, vec![2, 3]);
-        let core2 = RaftCore::new(2, vec![1, 3]);
-        let core3 = RaftCore::new(3, vec![1, 2]);
+        let core1 = new_test_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
 
         let transport1 = transports.remove(&1).unwrap();
         let transport2 = transports.remove(&2).unwrap();
@@ -627,9 +633,9 @@ mod tests {
         let timeout = Duration::from_millis(100);
         let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
 
-        let core1 = RaftCore::new(1, vec![2, 3]);
-        let core2 = RaftCore::new(2, vec![1, 3]);
-        let core3 = RaftCore::new(3, vec![1, 2]);
+        let core1 = new_test_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
 
         let transport1 = transports.remove(&1).unwrap();
 
@@ -673,9 +679,9 @@ mod tests {
         let timeout = Duration::from_millis(100);
         let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
 
-        let core1 = RaftCore::new(1, vec![2, 3]);
-        let core2 = RaftCore::new(2, vec![1, 3]);
-        let core3 = RaftCore::new(3, vec![1, 2]);
+        let core1 = new_test_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
 
         let transport1 = transports.remove(&1).unwrap();
         let transport2 = transports.remove(&2).unwrap();
@@ -723,9 +729,9 @@ mod tests {
         let timeout = Duration::from_millis(100);
         let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
 
-        let core1 = RaftCore::new(1, vec![2, 3]);
-        let core2 = RaftCore::new(2, vec![1, 3]);
-        let core3 = RaftCore::new(3, vec![1, 2]);
+        let core1 = new_test_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
 
         let transport1 = transports.remove(&1).unwrap();
 
@@ -784,9 +790,9 @@ mod tests {
         let timeout = Duration::from_millis(100);
         let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
 
-        let core1 = RaftCore::new(1, vec![2, 3]);
-        let core2 = RaftCore::new(2, vec![1, 3]);
-        let core3 = RaftCore::new(3, vec![1, 2]);
+        let core1 = new_test_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
 
         let transport1 = transports.remove(&1).unwrap();
         let transport2 = transports.remove(&2).unwrap();
@@ -839,7 +845,7 @@ mod tests {
         let timeout = Duration::from_millis(100);
         let (mut transports, _handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
 
-        let core1 = RaftCore::new(1, vec![2, 3]);
+        let core1 = new_test_core(1, vec![2, 3]);
         let transport1 = transports.remove(&1).unwrap();
 
         // Use long election timeout so we control when elections happen
@@ -883,9 +889,9 @@ mod tests {
         let timeout = Duration::from_millis(100);
         let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
 
-        let core1 = RaftCore::new(1, vec![2, 3]);
-        let mut core2 = RaftCore::new(2, vec![1, 3]);
-        let core3 = RaftCore::new(3, vec![1, 2]);
+        let core1 = new_test_core(1, vec![2, 3]);
+        let mut core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
 
         let transport1 = transports.remove(&1).unwrap();
 

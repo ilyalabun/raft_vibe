@@ -195,6 +195,34 @@ Added integration tests for RaftServer covering the full client command flow (su
 
 Added tests verifying that candidates reject client commands (not just followers), and that commands fail properly when a leader loses leadership mid-operation (e.g., sees a higher term during replication). Test suite now has 86 tests covering core Raft logic, async operations, and failure scenarios.
 
+## Day 7: Persistence Layer
+
+**Prompt:** "let's work on persistence. I want to implement persistence behind some interface to be able to run unit tests quickly without side effects. what do you think?"
+
+**Designing the Storage Abstraction**
+
+Discussed the design for a persistence layer that abstracts storage behind a trait. Raft requires three pieces of state to be persisted before responding to RPCs: `current_term`, `voted_for`, and `log[]`. Created a `Storage` trait with methods for loading/saving these values, plus fine-grained log operations (`append_log_entries`, `truncate_log`). Added `StorageError` enum for error handling. Chose to use `Box<dyn Storage>` (trait objects) instead of generics to keep `RaftCore` non-generic and avoid complexity propagation through the codebase.
+
+**Prompt:** "can we avoid generics in RaftCore?" and "what about error handling for storage operations?"
+
+**Implementation Decisions**
+
+Decided to use trait objects (`Box<dyn Storage>`) to keep `RaftCore` simple and non-generic. For error handling, chose to panic on storage failures - this is correct for Raft since failing to persist before responding violates protocol safety. In production, a node that can't persist should crash rather than risk inconsistency. Tests use `MemoryStorage` which never fails.
+
+**Implementing the Storage Layer**
+
+Created `src/storage.rs` with the `Storage` trait and `StorageError` type. Created `src/storage_memory.rs` with `MemoryStorage` implementation - a fast, in-memory storage perfect for unit tests. Updated `RaftCore` to take a `Box<dyn Storage>` in its constructor and load initial state from storage. Added persistence helper methods (`set_term`, `set_voted_for`, `update_term`, `persist_log_entry`, `persist_truncate_log`) that update both in-memory state and storage atomically. Modified all methods that change persistent state to use these helpers. Added `Send` bound to `Storage` trait for async compatibility.
+
+**Updating Tests**
+
+Created a `new_test_core()` helper function in each test module to create `RaftCore` with `MemoryStorage`. Updated all 92 tests across `raft_core.rs`, `raft_node.rs`, `raft_server.rs`, and `transport_inmemory.rs` to use the new constructor. All tests pass.
+
+---
+
+## Next Up
+
+- **Day 8: File-Based Storage** - Implement `FileStorage` for real persistence to disk
+
 ---
 
 ## Notes
