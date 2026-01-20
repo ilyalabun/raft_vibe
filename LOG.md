@@ -223,11 +223,35 @@ Created a `new_test_core()` helper function in each test module to create `RaftC
 
 Added 8 tests verifying that nodes correctly restore state after a restart. Tests cover: loading saved term, voted_for, and log entries individually and together; verifying volatile state (commit_index, last_applied, leadership) resets on restart; ensuring a restarted node respects its previous vote and can continue participating in elections; and confirming a former leader restarts as follower and must re-establish leadership. Test suite now has 100 tests.
 
+**Prompt:** "let's think of possible *real* persistence implementation"
+
+**Exploring Storage Options**
+
+Discussed various approaches for real persistence: simple file-based (separate files for term, voted_for, log), single file with JSON/bincode, write-ahead log (WAL), SQLite, and sled. Decided to implement file-based storage first for learning purposes - it reveals the challenges of crash-safe persistence.
+
+**Prompt:** "show me file-based implementation first"
+
+**File-Based Storage Implementation**
+
+Created `FileStorage` in `storage_file.rs` using three files: `term`, `voted_for`, and `log` (JSON lines format). Discussed the trade-offs of atomic writes (write to temp + rename) vs direct writes for small data. For tiny files like term (few bytes), direct write + fsync is effectively atomic at the disk block level.
+
+**Prompt:** "but what about partial block write? Is it possible?"
+
+**Understanding Disk Atomicity**
+
+Explored the nuances of disk write atomicity. Modern drives have capacitors to complete sector writes on power loss, and most guarantee 512-byte sector atomicity - but it's not guaranteed by the POSIX spec. Real databases use checksums to detect any corruption.
+
+**Prompt:** "let's do with checksums"
+
+**Adding CRC32 Checksums**
+
+Implemented CRC32 checksums (IEEE polynomial, same as zlib/gzip) for all persistent data. File format: `{data} {crc32_hex}\n`. On load, verify checksum and return `StorageError::Corruption` if mismatch. Added serde for JSON serialization and tempfile for tests. Added corruption detection tests. Test suite now has 109 tests.
+
 ---
 
 ## Next Up
 
-- **Day 8: File-Based Storage** - Implement `FileStorage` for real persistence to disk
+- **Day 8: State Machine** - Implement a pluggable state machine abstraction and a simple key-value store
 
 ---
 

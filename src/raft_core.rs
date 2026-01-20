@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::storage::Storage;
 
 /// Raft node states
@@ -19,7 +21,7 @@ pub enum RaftState {
 }
 
 /// A single log entry
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
     /// Term when entry was received by leader
     pub term: u64,

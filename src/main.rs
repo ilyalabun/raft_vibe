@@ -8,6 +8,7 @@ mod raft_node;
 mod raft_core;
 mod raft_server;
 mod storage;
+mod storage_file;
 mod storage_memory;
 mod transport;
 mod transport_inmemory;
