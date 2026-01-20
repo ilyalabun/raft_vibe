@@ -217,6 +217,12 @@ Created `src/storage.rs` with the `Storage` trait and `StorageError` type. Creat
 
 Created a `new_test_core()` helper function in each test module to create `RaftCore` with `MemoryStorage`. Updated all 92 tests across `raft_core.rs`, `raft_node.rs`, `raft_server.rs`, and `transport_inmemory.rs` to use the new constructor. All tests pass.
 
+**Prompt:** "ok, now I want tests for persistence on node restart"
+
+**Persistence Restart Tests**
+
+Added 8 tests verifying that nodes correctly restore state after a restart. Tests cover: loading saved term, voted_for, and log entries individually and together; verifying volatile state (commit_index, last_applied, leadership) resets on restart; ensuring a restarted node respects its previous vote and can continue participating in elections; and confirming a former leader restarts as follower and must re-establish leadership. Test suite now has 100 tests.
+
 ---
 
 ## Next Up

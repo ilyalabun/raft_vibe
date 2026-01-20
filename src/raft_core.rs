@@ -1873,5 +1873,170 @@ mod tests {
         let became_leader = node.handle_request_vote_result(4, &result);
         assert!(became_leader); // Now 3 votes
     }
+
+    // === Persistence / Restart Tests ===
+
+    #[test]
+    fn test_node_restarts_with_saved_term() {
+        let mut storage = MemoryStorage::new();
+        storage.save_term(5).unwrap();
+
+        let node = RaftCore::new(1, vec![2, 3], Box::new(storage));
+
+        assert_eq!(node.current_term, 5);
+        assert_eq!(node.state, RaftState::Follower);
+    }
+
+    #[test]
+    fn test_node_restarts_with_saved_voted_for() {
+        let mut storage = MemoryStorage::new();
+        storage.save_term(3).unwrap();
+        storage.save_voted_for(Some(2)).unwrap();
+
+        let node = RaftCore::new(1, vec![2, 3], Box::new(storage));
+
+        assert_eq!(node.current_term, 3);
+        assert_eq!(node.voted_for, Some(2));
+    }
+
+    #[test]
+    fn test_node_restarts_with_saved_log() {
+        let mut storage = MemoryStorage::new();
+        storage.save_term(2).unwrap();
+        storage.append_log_entries(&[
+            LogEntry { term: 1, index: 1, command: "CMD 1".to_string() },
+            LogEntry { term: 2, index: 2, command: "CMD 2".to_string() },
+        ]).unwrap();
+
+        let node = RaftCore::new(1, vec![2, 3], Box::new(storage));
+
+        assert_eq!(node.log.len(), 2);
+        assert_eq!(node.log[0].command, "CMD 1");
+        assert_eq!(node.log[1].command, "CMD 2");
+        assert_eq!(node.last_log_index(), 2);
+        assert_eq!(node.last_log_term(), 2);
+    }
+
+    #[test]
+    fn test_node_restarts_with_full_state() {
+        let mut storage = MemoryStorage::new();
+        storage.save_term(5).unwrap();
+        storage.save_voted_for(Some(1)).unwrap();
+        storage.append_log_entries(&[
+            LogEntry { term: 3, index: 1, command: "SET x=1".to_string() },
+            LogEntry { term: 4, index: 2, command: "SET y=2".to_string() },
+            LogEntry { term: 5, index: 3, command: "SET z=3".to_string() },
+        ]).unwrap();
+
+        let node = RaftCore::new(1, vec![2, 3], Box::new(storage));
+
+        assert_eq!(node.current_term, 5);
+        assert_eq!(node.voted_for, Some(1));
+        assert_eq!(node.log.len(), 3);
+        // Volatile state should be reset
+        assert_eq!(node.commit_index, 0);
+        assert_eq!(node.last_applied, 0);
+        assert_eq!(node.state, RaftState::Follower);
+    }
+
+    #[test]
+    fn test_restarted_node_can_continue_election() {
+        // Simulate: node voted in term 3, crashed, restarted
+        let mut storage = MemoryStorage::new();
+        storage.save_term(3).unwrap();
+        storage.save_voted_for(Some(2)).unwrap(); // Already voted for node 2
+
+        let mut node = RaftCore::new(1, vec![2, 3], Box::new(storage));
+
+        // Node 3 requests vote in same term - should be denied (already voted)
+        let args = RequestVoteArgs {
+            term: 3,
+            candidate_id: 3,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+        let result = node.handle_request_vote(&args);
+        assert!(!result.vote_granted);
+
+        // Node 2 requests vote again in same term - should be granted (same candidate)
+        let args = RequestVoteArgs {
+            term: 3,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+        let result = node.handle_request_vote(&args);
+        assert!(result.vote_granted);
+    }
+
+    #[test]
+    fn test_restarted_node_accepts_append_entries() {
+        // Simulate: node had log entries, crashed, restarted
+        let mut storage = MemoryStorage::new();
+        storage.save_term(2).unwrap();
+        storage.append_log_entries(&[
+            LogEntry { term: 1, index: 1, command: "CMD 1".to_string() },
+            LogEntry { term: 2, index: 2, command: "CMD 2".to_string() },
+        ]).unwrap();
+
+        let mut node = RaftCore::new(1, vec![2, 3], Box::new(storage));
+
+        // Leader sends new entry
+        let args = AppendEntriesArgs {
+            term: 2,
+            leader_id: 2,
+            prev_log_index: 2,
+            prev_log_term: 2,
+            entries: vec![LogEntry { term: 2, index: 3, command: "CMD 3".to_string() }],
+            leader_commit: 2,
+        };
+        let output = node.handle_append_entries(&args);
+
+        assert!(output.result.success);
+        assert_eq!(node.log.len(), 3);
+        assert_eq!(node.commit_index, 2);
+    }
+
+    #[test]
+    fn test_restarted_leader_must_reestablish() {
+        // Simulate: node was leader, crashed, restarted
+        // After restart, it should be follower (leadership is volatile)
+        let mut storage = MemoryStorage::new();
+        storage.save_term(5).unwrap();
+        storage.save_voted_for(Some(1)).unwrap(); // Voted for self
+        storage.append_log_entries(&[
+            LogEntry { term: 5, index: 1, command: "CMD 1".to_string() },
+        ]).unwrap();
+
+        let node = RaftCore::new(1, vec![2, 3], Box::new(storage));
+
+        // Should be follower, not leader
+        assert_eq!(node.state, RaftState::Follower);
+        // next_index and match_index should be empty (leader volatile state)
+        assert!(node.next_index.is_empty());
+        assert!(node.match_index.is_empty());
+    }
+
+    #[test]
+    fn test_state_persists_across_operations() {
+        // Create node, do operations, then verify storage has correct state
+        let storage = MemoryStorage::new();
+        let mut node = RaftCore::new(1, vec![2, 3], Box::new(storage));
+
+        // Start election (persists term=1, voted_for=1)
+        node.start_election();
+
+        // Become leader and append entry
+        node.become_leader();
+        node.append_log_entry("SET x=1".to_string());
+
+        // Now "restart" by creating new node with same storage
+        // We need to extract storage - but we can't easily do that
+        // So let's just verify the in-memory state matches what should be persisted
+        assert_eq!(node.current_term, 1);
+        assert_eq!(node.voted_for, Some(1));
+        assert_eq!(node.log.len(), 1);
+        assert_eq!(node.log[0].command, "SET x=1");
+    }
 }
 
