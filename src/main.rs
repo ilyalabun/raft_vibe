@@ -7,6 +7,8 @@ mod config;
 mod raft_node;
 mod raft_core;
 mod raft_server;
+mod state_machine;
+mod state_machine_kv;
 mod storage;
 mod storage_file;
 mod storage_memory;
@@ -20,9 +22,24 @@ fn main() {
     println!("=== Raft Consensus Algorithm Demo ===\n");
 
     // Create three nodes in a cluster
-    let mut node1 = RaftCore::new(1, vec![2, 3], Box::new(MemoryStorage::new()));
-    let mut node2 = RaftCore::new(2, vec![1, 3], Box::new(MemoryStorage::new()));
-    let mut node3 = RaftCore::new(3, vec![1, 2], Box::new(MemoryStorage::new()));
+    let mut node1 = RaftCore::new(
+        1,
+        vec![2, 3],
+        Box::new(MemoryStorage::new()),
+        Box::new(state_machine::TestStateMachine::new()),
+    );
+    let mut node2 = RaftCore::new(
+        2,
+        vec![1, 3],
+        Box::new(MemoryStorage::new()),
+        Box::new(state_machine::TestStateMachine::new()),
+    );
+    let mut node3 = RaftCore::new(
+        3,
+        vec![1, 2],
+        Box::new(MemoryStorage::new()),
+        Box::new(state_machine::TestStateMachine::new()),
+    );
 
     println!("Created 3-node cluster:");
     println!("  Node 1: {:?}", node1.state);

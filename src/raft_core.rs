@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::state_machine::StateMachine;
 use crate::storage::Storage;
 
 /// Raft node states
@@ -104,6 +105,8 @@ pub struct HandleAppendEntriesOutput {
 pub struct RaftCore {
     // Storage backend for persistent state
     storage: Box<dyn Storage>,
+    // State machine to apply committed entries to
+    state_machine: Box<dyn StateMachine>,
 
     // Persistent state on all servers (updated on stable storage before responding to RPCs)
     // These are cached in memory for fast access, but always persisted via storage
@@ -138,9 +141,14 @@ pub struct RaftCore {
 }
 
 impl RaftCore {
-    /// Create a new Raft core with the given storage backend
+    /// Create a new Raft core with the given storage backend and state machine
     /// Loads persistent state (term, voted_for, log) from storage
-    pub fn new(id: u64, peers: Vec<u64>, storage: Box<dyn Storage>) -> Self {
+    pub fn new(
+        id: u64,
+        peers: Vec<u64>,
+        storage: Box<dyn Storage>,
+        state_machine: Box<dyn StateMachine>,
+    ) -> Self {
         // Load persistent state from storage
         let current_term = storage.load_term().expect("failed to load term from storage");
         let voted_for = storage.load_voted_for().expect("failed to load voted_for from storage");
@@ -148,6 +156,7 @@ impl RaftCore {
 
         RaftCore {
             storage,
+            state_machine,
             current_term,
             voted_for,
             log,
@@ -422,11 +431,11 @@ impl RaftCore {
     /// Apply committed entries to the state machine
     /// Updates last_applied to match commit_index
     pub fn apply_committed_entries(&mut self) {
-        // In a full implementation, this would apply entries to the state machine
-        // For now, we just update last_applied to track what's been applied
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
-            // In a real implementation, we would apply self.log[(self.last_applied - 1) as usize] to the state machine
+            let entry = &self.log[(self.last_applied - 1) as usize];
+            // TODO: collect results for client response
+            let _ = self.state_machine.apply(&entry.command);
         }
     }
 
@@ -557,7 +566,12 @@ mod tests {
 
     /// Helper to create RaftCore with MemoryStorage for tests
     fn new_test_core(id: u64, peers: Vec<u64>) -> RaftCore {
-        RaftCore::new(id, peers, Box::new(MemoryStorage::new()))
+        RaftCore::new(
+            id,
+            peers,
+            Box::new(MemoryStorage::new()),
+            Box::new(crate::state_machine::TestStateMachine::new()),
+        )
     }
 
     #[test]
@@ -1714,7 +1728,7 @@ mod tests {
             term: 3,
             success: true,
         };
-        let committed = leader.handle_append_entries_result(2, 1, &stale_result);
+        let _committed = leader.handle_append_entries_result(2, 1, &stale_result);
 
         // Should still process (term is lower, so no step-down)
         // Entry should be counted for commit
@@ -1883,7 +1897,12 @@ mod tests {
         let mut storage = MemoryStorage::new();
         storage.save_term(5).unwrap();
 
-        let node = RaftCore::new(1, vec![2, 3], Box::new(storage));
+        let node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(storage),
+            Box::new(crate::state_machine::TestStateMachine::new()),
+        );
 
         assert_eq!(node.current_term, 5);
         assert_eq!(node.state, RaftState::Follower);
@@ -1895,7 +1914,12 @@ mod tests {
         storage.save_term(3).unwrap();
         storage.save_voted_for(Some(2)).unwrap();
 
-        let node = RaftCore::new(1, vec![2, 3], Box::new(storage));
+        let node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(storage),
+            Box::new(crate::state_machine::TestStateMachine::new()),
+        );
 
         assert_eq!(node.current_term, 3);
         assert_eq!(node.voted_for, Some(2));
@@ -1910,7 +1934,12 @@ mod tests {
             LogEntry { term: 2, index: 2, command: "CMD 2".to_string() },
         ]).unwrap();
 
-        let node = RaftCore::new(1, vec![2, 3], Box::new(storage));
+        let node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(storage),
+            Box::new(crate::state_machine::TestStateMachine::new()),
+        );
 
         assert_eq!(node.log.len(), 2);
         assert_eq!(node.log[0].command, "CMD 1");
@@ -1930,7 +1959,12 @@ mod tests {
             LogEntry { term: 5, index: 3, command: "SET z=3".to_string() },
         ]).unwrap();
 
-        let node = RaftCore::new(1, vec![2, 3], Box::new(storage));
+        let node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(storage),
+            Box::new(crate::state_machine::TestStateMachine::new()),
+        );
 
         assert_eq!(node.current_term, 5);
         assert_eq!(node.voted_for, Some(1));
@@ -1948,7 +1982,12 @@ mod tests {
         storage.save_term(3).unwrap();
         storage.save_voted_for(Some(2)).unwrap(); // Already voted for node 2
 
-        let mut node = RaftCore::new(1, vec![2, 3], Box::new(storage));
+        let mut node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(storage),
+            Box::new(crate::state_machine::TestStateMachine::new()),
+        );
 
         // Node 3 requests vote in same term - should be denied (already voted)
         let args = RequestVoteArgs {
@@ -1981,7 +2020,12 @@ mod tests {
             LogEntry { term: 2, index: 2, command: "CMD 2".to_string() },
         ]).unwrap();
 
-        let mut node = RaftCore::new(1, vec![2, 3], Box::new(storage));
+        let mut node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(storage),
+            Box::new(crate::state_machine::TestStateMachine::new()),
+        );
 
         // Leader sends new entry
         let args = AppendEntriesArgs {
@@ -2010,7 +2054,12 @@ mod tests {
             LogEntry { term: 5, index: 1, command: "CMD 1".to_string() },
         ]).unwrap();
 
-        let node = RaftCore::new(1, vec![2, 3], Box::new(storage));
+        let node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(storage),
+            Box::new(crate::state_machine::TestStateMachine::new()),
+        );
 
         // Should be follower, not leader
         assert_eq!(node.state, RaftState::Follower);
@@ -2023,7 +2072,12 @@ mod tests {
     fn test_state_persists_across_operations() {
         // Create node, do operations, then verify storage has correct state
         let storage = MemoryStorage::new();
-        let mut node = RaftCore::new(1, vec![2, 3], Box::new(storage));
+        let mut node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(storage),
+            Box::new(crate::state_machine::TestStateMachine::new()),
+        );
 
         // Start election (persists term=1, voted_for=1)
         node.start_election();
@@ -2039,6 +2093,94 @@ mod tests {
         assert_eq!(node.voted_for, Some(1));
         assert_eq!(node.log.len(), 1);
         assert_eq!(node.log[0].command, "SET x=1");
+    }
+
+    // === State Machine Apply Tests ===
+
+    #[test]
+    fn test_apply_committed_entries_updates_last_applied() {
+        let mut node = new_test_core(1, vec![2, 3]);
+        node.become_leader();
+
+        // Append some entries
+        node.append_log_entry("CMD 1".to_string());
+        node.append_log_entry("CMD 2".to_string());
+        node.append_log_entry("CMD 3".to_string());
+
+        assert_eq!(node.last_applied, 0);
+        assert_eq!(node.commit_index, 0);
+
+        // Simulate committing entries (in real scenario, this happens via majority replication)
+        node.commit_index = 2;
+        node.apply_committed_entries();
+
+        assert_eq!(node.last_applied, 2);
+
+        // Commit more
+        node.commit_index = 3;
+        node.apply_committed_entries();
+
+        assert_eq!(node.last_applied, 3);
+    }
+
+    #[test]
+    fn test_apply_committed_entries_does_nothing_when_up_to_date() {
+        let mut node = new_test_core(1, vec![2, 3]);
+        node.become_leader();
+
+        node.append_log_entry("CMD 1".to_string());
+        node.commit_index = 1;
+        node.apply_committed_entries();
+
+        assert_eq!(node.last_applied, 1);
+
+        // Call again - should do nothing
+        node.apply_committed_entries();
+        assert_eq!(node.last_applied, 1);
+    }
+
+    #[test]
+    fn test_entries_applied_to_state_machine() {
+        use crate::state_machine::{AppliedCommands, TestStateMachine};
+
+        // Create a shared vec we can inspect
+        let applied: AppliedCommands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(TestStateMachine::new_shared(applied.clone())),
+        );
+
+        node.become_leader();
+        node.append_log_entry("SET x=1".to_string());
+        node.append_log_entry("SET y=2".to_string());
+        node.append_log_entry("SET z=3".to_string());
+
+        // Nothing applied yet
+        assert!(applied.lock().unwrap().is_empty());
+
+        // Commit first two entries
+        node.commit_index = 2;
+        node.apply_committed_entries();
+
+        {
+            let applied = applied.lock().unwrap();
+            assert_eq!(applied.len(), 2);
+            assert_eq!(applied[0], "SET x=1");
+            assert_eq!(applied[1], "SET y=2");
+        }
+
+        // Commit remaining entry
+        node.commit_index = 3;
+        node.apply_committed_entries();
+
+        {
+            let applied = applied.lock().unwrap();
+            assert_eq!(applied.len(), 3);
+            assert_eq!(applied[2], "SET z=3");
+        }
     }
 }
 

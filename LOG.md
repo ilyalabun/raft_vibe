@@ -247,11 +247,27 @@ Explored the nuances of disk write atomicity. Modern drives have capacitors to c
 
 Implemented CRC32 checksums (IEEE polynomial, same as zlib/gzip) for all persistent data. File format: `{data} {crc32_hex}\n`. On load, verify checksum and return `StorageError::Corruption` if mismatch. Added serde for JSON serialization and tempfile for tests. Added corruption detection tests. Test suite now has 109 tests.
 
+## Day 8: State Machine
+
+**Prompt:** "ok, new day. let's continue"
+
+**Designing the State Machine Abstraction**
+
+Implemented a pluggable state machine abstraction for Raft. Created a `StateMachine` trait in `state_machine.rs` with a single `apply(command: &str) -> ApplyResult` method where `ApplyResult = Result<String, String>`. The trait requires `Send` for async compatibility. Added `TestStateMachine` that records all applied commands for verification in tests.
+
+**Implementing KeyValueStore**
+
+Created `KeyValueStore` in `state_machine_kv.rs` - a simple in-memory key-value store implementing `StateMachine`. Only state-changing commands go through `apply()`: `SET key value` and `DELETE key`. Reads use the direct `get()` method which bypasses Raft - this is correct because reads don't change state and shouldn't be replicated. Uses `splitn(3, ' ')` to allow values with spaces.
+
+**Integrating State Machine into RaftCore**
+
+Updated `RaftCore` to hold a `Box<dyn StateMachine>` alongside the storage. Modified `apply_committed_entries()` to actually call the state machine's `apply()` method when entries are committed. `TestStateMachine` uses `Arc<Mutex<Vec<String>>>` to allow tests to verify exactly which commands were applied. Added integration tests verifying: (1) commands are applied to state machine when quorum is reached, (2) commands are NOT applied when leader is partitioned, and (3) followers apply commands after receiving heartbeat with updated commit_index. Test suite now has 122 tests.
+
 ---
 
 ## Next Up
 
-- **Day 8: State Machine** - Implement a pluggable state machine abstraction and a simple key-value store
+- **Day 9: Client API** - Add proper client command handling with results from state machine
 
 ---
 

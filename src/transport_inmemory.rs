@@ -189,7 +189,12 @@ mod tests {
 
     /// Helper to create RaftCore with MemoryStorage for tests
     fn new_test_core(id: u64, peers: Vec<u64>) -> RaftCore {
-        RaftCore::new(id, peers, Box::new(MemoryStorage::new()))
+        RaftCore::new(
+            id,
+            peers,
+            Box::new(MemoryStorage::new()),
+            Box::new(crate::state_machine::TestStateMachine::new()),
+        )
     }
 
     #[tokio::test]

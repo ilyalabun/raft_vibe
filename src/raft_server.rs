@@ -210,12 +210,28 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Mutex;
     use crate::config::RaftConfig;
+    use crate::state_machine::{AppliedCommands, TestStateMachine};
     use crate::storage_memory::MemoryStorage;
     use crate::transport_inmemory::create_cluster;
 
     /// Helper to create RaftCore with MemoryStorage for tests
     fn new_test_core(id: u64, peers: Vec<u64>) -> RaftCore {
-        RaftCore::new(id, peers, Box::new(MemoryStorage::new()))
+        RaftCore::new(
+            id,
+            peers,
+            Box::new(MemoryStorage::new()),
+            Box::new(TestStateMachine::new()),
+        )
+    }
+
+    /// Helper to create RaftCore with a shared state machine for verification
+    fn new_test_core_with_shared(id: u64, peers: Vec<u64>, applied: AppliedCommands) -> RaftCore {
+        RaftCore::new(
+            id,
+            peers,
+            Box::new(MemoryStorage::new()),
+            Box::new(TestStateMachine::new_shared(applied)),
+        )
     }
 
     #[tokio::test]
@@ -937,5 +953,242 @@ mod tests {
 
         let result = submit_task.await.unwrap();
         assert!(matches!(result, Err(RaftError::NotLeader)));
+    }
+
+    // === State Machine Apply Integration Tests ===
+
+    #[tokio::test(start_paused = true)]
+    async fn test_entry_applied_when_quorum_reached() {
+        use crate::transport_inmemory::create_cluster_with_timeout;
+
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        // Create recording state machine for leader to verify applies
+        let applied1: AppliedCommands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let core1 = new_test_core_with_shared(1, vec![2, 3], applied1.clone());
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let config = RaftConfig::default()
+            .with_election_timeout(Duration::from_secs(100), Duration::from_secs(100));
+
+        let (server1, shared1, _) = RaftServer::with_config(core1, transport1, config);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Win election
+        server1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        // Verify nothing applied yet
+        assert!(applied1.lock().unwrap().is_empty());
+
+        // Start server and submit command
+        let client_handle = server1.start();
+
+        let submit_task = tokio::spawn(async move {
+            client_handle.submit("SET x=42".to_string()).await
+        });
+
+        let shared2_clone = shared2.clone();
+        let shared3_clone = shared3.clone();
+        tokio::spawn(async move {
+            tokio::join!(
+                handle2.process_one_shared(&shared2_clone),
+                handle3.process_one_shared(&shared3_clone),
+            );
+        });
+
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+
+        let result = submit_task.await.unwrap();
+        assert!(result.is_ok());
+
+        // Entry should be committed AND applied on leader
+        assert_eq!(shared1.lock().await.commit_index, 1);
+        assert_eq!(shared1.lock().await.last_applied, 1);
+
+        // Verify the command was actually applied to state machine
+        let applied = applied1.lock().unwrap();
+        assert_eq!(applied.len(), 1, "One command should be applied");
+        assert_eq!(applied[0], "SET x=42", "Correct command should be applied");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_entry_not_applied_without_quorum() {
+        use crate::transport_inmemory::create_cluster_with_timeout;
+
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        // Create recording state machine for leader
+        let applied1: AppliedCommands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let core1 = new_test_core_with_shared(1, vec![2, 3], applied1.clone());
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let (server1, shared1, _) = RaftServer::new(core1, transport1);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Win election
+        server1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        // Append entry directly (simulating client command)
+        {
+            let mut core = shared1.lock().await;
+            core.append_log_entry("CMD during partition".to_string());
+        }
+
+        // Replicate but don't process peer requests (simulating partition)
+        // Both peers will timeout
+        server1.node.replicate_to_peers(1).await;
+
+        // Entry should be in log but NOT committed, NOT applied
+        assert_eq!(shared1.lock().await.log.len(), 1);
+        assert_eq!(shared1.lock().await.commit_index, 0, "Should not commit without quorum");
+        assert_eq!(shared1.lock().await.last_applied, 0, "Should not apply without commit");
+
+        // Verify command was NOT applied to state machine
+        let applied = applied1.lock().unwrap();
+        assert!(applied.is_empty(), "No commands should be applied without quorum");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_follower_applies_entry_on_commit_notification() {
+        use crate::transport_inmemory::create_cluster_with_timeout;
+
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        // Create shared state machines for all nodes
+        let applied1: AppliedCommands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let applied2: AppliedCommands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let applied3: AppliedCommands = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let core1 = new_test_core_with_shared(1, vec![2, 3], applied1.clone());
+        let core2 = new_test_core_with_shared(2, vec![1, 3], applied2.clone());
+        let core3 = new_test_core_with_shared(3, vec![1, 2], applied3.clone());
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        // Short heartbeat interval so we can trigger it by advancing time
+        let config = RaftConfig::default()
+            .with_election_timeout(Duration::from_secs(100), Duration::from_secs(100))
+            .with_heartbeat_interval(Duration::from_millis(50));
+
+        let (server1, shared1, _) = RaftServer::with_config(core1, transport1, config);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Win election
+        server1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+
+        // Start server
+        let client_handle = server1.start();
+
+        // Spawn peer handlers that will process multiple requests (replication + heartbeat)
+        let shared2_clone = shared2.clone();
+        let shared3_clone = shared3.clone();
+        tokio::spawn(async move {
+            // Process replication request
+            tokio::join!(
+                handle2.process_one_shared(&shared2_clone),
+                handle3.process_one_shared(&shared3_clone),
+            );
+            // Process heartbeat request
+            tokio::join!(
+                handle2.process_one_shared(&shared2_clone),
+                handle3.process_one_shared(&shared3_clone),
+            );
+        });
+
+        // Submit command
+        let submit_task = tokio::spawn(async move {
+            client_handle.submit("SET x=42".to_string()).await
+        });
+
+        // Advance time to let replication complete
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+
+        submit_task.await.unwrap().unwrap();
+
+        // Leader should have committed and applied
+        assert_eq!(shared1.lock().await.commit_index, 1);
+        assert_eq!(shared1.lock().await.last_applied, 1);
+
+        // Verify leader's state machine received the command
+        {
+            let leader_applied = applied1.lock().unwrap();
+            assert_eq!(leader_applied.len(), 1);
+            assert_eq!(leader_applied[0], "SET x=42");
+        }
+
+        // Followers have entry but may not have applied yet
+        assert_eq!(shared2.lock().await.log.len(), 1);
+        assert_eq!(shared3.lock().await.log.len(), 1);
+
+        // Advance time past heartbeat interval to trigger heartbeat with updated commit_index
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // Now followers should have applied
+        assert_eq!(shared2.lock().await.commit_index, 1);
+        assert_eq!(shared2.lock().await.last_applied, 1);
+        assert_eq!(shared3.lock().await.commit_index, 1);
+        assert_eq!(shared3.lock().await.last_applied, 1);
+
+        // Verify followers' state machines received the command
+        {
+            let follower2_applied = applied2.lock().unwrap();
+            assert_eq!(follower2_applied.len(), 1, "Follower 2 should have applied");
+            assert_eq!(follower2_applied[0], "SET x=42");
+        }
+        {
+            let follower3_applied = applied3.lock().unwrap();
+            assert_eq!(follower3_applied.len(), 1, "Follower 3 should have applied");
+            assert_eq!(follower3_applied[0], "SET x=42");
+        }
     }
 }
