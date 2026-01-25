@@ -12,8 +12,12 @@ use crate::transport::{Transport, TransportError};
 /// Errors that can occur during Raft operations
 #[derive(Debug, Clone)]
 pub enum RaftError {
-    /// This node is not the leader
-    NotLeader,
+    /// This node is not the leader (includes leader hint if known)
+    NotLeader { leader_hint: Option<u64> },
+    /// Entry was not committed (couldn't reach majority)
+    NotCommitted,
+    /// State machine returned an error
+    StateMachine(String),
     /// Transport error occurred
     Transport(TransportError),
 }
@@ -23,7 +27,7 @@ enum Command {
     /// Submit a client command to be replicated
     Submit {
         command: String,
-        reply: oneshot::Sender<Result<u64, RaftError>>,
+        reply: oneshot::Sender<Result<String, RaftError>>,
     },
 }
 
@@ -45,8 +49,8 @@ pub struct RaftHandle {
 
 impl RaftHandle {
     /// Submit a command to the Raft cluster
-    /// Returns the log index if successful
-    pub async fn submit(&self, command: String) -> Result<u64, RaftError> {
+    /// Returns the state machine result if successful
+    pub async fn submit(&self, command: String) -> Result<String, RaftError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
             .send(Command::Submit {
@@ -54,9 +58,9 @@ impl RaftHandle {
                 reply: reply_tx,
             })
             .await
-            .map_err(|_| RaftError::NotLeader)?;
+            .map_err(|_| RaftError::NotLeader { leader_hint: None })?;
 
-        reply_rx.await.map_err(|_| RaftError::NotLeader)?
+        reply_rx.await.map_err(|_| RaftError::NotLeader { leader_hint: None })?
     }
 }
 
@@ -160,26 +164,28 @@ impl<T: Transport + 'static> RaftServer<T> {
     }
 
     /// Handle a client submit command
-    async fn handle_submit(&self, command: String) -> Result<u64, RaftError> {
+    /// Returns the state machine result if committed, or an error
+    async fn handle_submit(&self, command: String) -> Result<String, RaftError> {
         let shared_core = self.node.shared_core();
         let entry_index = {
             let mut core = shared_core.lock().await;
 
             // Only leaders can accept commands
             if core.state != RaftState::Leader {
-                return Err(RaftError::NotLeader);
+                return Err(RaftError::NotLeader { leader_hint: core.current_leader });
             }
 
             // Append to local log
-            let entry = core.append_log_entry(command).ok_or(RaftError::NotLeader)?;
+            let entry = core.append_log_entry(command).ok_or(RaftError::NotLeader { leader_hint: None })?;
             entry.index
         };
 
-        // Replicate to all peers
-        self.node.replicate_to_peers(entry_index).await;
-
-        // Return the index
-        Ok(entry_index)
+        // Replicate to all peers and get state machine result
+        match self.node.replicate_to_peers(entry_index).await {
+            Some(Ok(result)) => Ok(result),
+            Some(Err(err)) => Err(RaftError::StateMachine(err)),
+            None => Err(RaftError::NotCommitted),
+        }
     }
 
     /// Start an election (delegates to RaftNode)
@@ -247,7 +253,7 @@ mod tests {
 
         // Node is not leader, should fail
         let result = handle.submit("SET x=1".to_string()).await;
-        assert!(matches!(result, Err(RaftError::NotLeader)));
+        assert!(matches!(result, Err(RaftError::NotLeader { .. })));
     }
 
     #[tokio::test]
@@ -483,9 +489,8 @@ mod tests {
         // Get submit result
         let result = submit_task.await.unwrap();
 
-        // Command should succeed
-        let index = result.expect("Command should succeed");
-        assert_eq!(index, 1);
+        // Command should succeed (TestStateMachine returns empty string)
+        assert!(result.is_ok());
 
         // Verify state on leader
         assert_eq!(shared1.lock().await.log.len(), 1);
@@ -560,11 +565,11 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        // Get submit results
+        // Get submit results (all should succeed)
         let (result1, result2, result3) = submit_task.await.unwrap();
-        assert_eq!(result1.unwrap(), 1);
-        assert_eq!(result2.unwrap(), 2);
-        assert_eq!(result3.unwrap(), 3);
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+        assert!(result3.is_ok());
 
         // All entries should be committed
         assert_eq!(shared1.lock().await.commit_index, 3);
@@ -892,7 +897,7 @@ mod tests {
         let result = submit_task.await.unwrap();
 
         // Candidate should reject the command
-        assert!(matches!(result, Err(RaftError::NotLeader)));
+        assert!(matches!(result, Err(RaftError::NotLeader { .. })));
     }
 
     #[tokio::test(start_paused = true)]
@@ -952,7 +957,7 @@ mod tests {
         }
 
         let result = submit_task.await.unwrap();
-        assert!(matches!(result, Err(RaftError::NotLeader)));
+        assert!(matches!(result, Err(RaftError::NotLeader { .. })));
     }
 
     // === State Machine Apply Integration Tests ===

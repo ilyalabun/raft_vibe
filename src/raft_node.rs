@@ -75,7 +75,9 @@ impl<T: Transport> RaftNode<T> {
     }
 
     /// Replicate log entries to all peers (sends requests concurrently)
-    pub async fn replicate_to_peers(&self, entry_index: u64) {
+    /// Replicate entry at entry_index to all peers
+    /// Returns the state machine result for entry_index if it was committed and applied
+    pub async fn replicate_to_peers(&self, entry_index: u64) -> Option<Result<String, String>> {
         let requests_to_send = {
             let core = self.core.lock().await;
 
@@ -124,13 +126,21 @@ impl<T: Transport> RaftNode<T> {
 
         let results = futures::future::join_all(futures).await;
 
-        // Process results
+        // Process results and find our entry's result
+        let mut entry_result = None;
         for (peer_id, result) in results {
             if let Ok(result) = result {
                 let mut core = self.core.lock().await;
-                core.handle_append_entries_result(peer_id, entry_index, &result);
+                let (_committed, apply_results) = core.handle_append_entries_result(peer_id, entry_index, &result);
+                // Look for our entry's result
+                for (idx, res) in apply_results {
+                    if idx == entry_index {
+                        entry_result = Some(res);
+                    }
+                }
             }
         }
+        entry_result
     }
 
     /// Get current state
@@ -203,11 +213,11 @@ impl<T: Transport> RaftNode<T> {
 
         let results = futures::future::join_all(futures).await;
 
-        // Process results
+        // Process results (ignore apply results for heartbeats - no client waiting)
         for (peer_id, result, last_entry_index) in results {
             if let Ok(result) = result {
                 let mut core = self.core.lock().await;
-                core.handle_append_entries_result(peer_id, last_entry_index, &result);
+                let _ = core.handle_append_entries_result(peer_id, last_entry_index, &result);
             }
         }
 

@@ -3,6 +3,7 @@
 //! This is an educational implementation of the Raft consensus protocol.
 //! Start by reading README.md and rust_basics.md!
 
+mod client_http;
 mod config;
 mod raft_node;
 mod raft_core;
@@ -135,8 +136,8 @@ fn main() {
     println!("  Node 3 log length: {}", node3.log.len());
 
     // Handle append entries results (encapsulates term update, replication tracking, and committing)
-    let committed_2 = node1.handle_append_entries_result(2, entry.index, &append_output_2.result);
-    let committed_3 = node1.handle_append_entries_result(3, entry.index, &append_output_3.result);
+    let (committed_2, _) = node1.handle_append_entries_result(2, entry.index, &append_output_2.result);
+    let (committed_3, _) = node1.handle_append_entries_result(3, entry.index, &append_output_3.result);
 
     // If entry was committed, send updated commit_index to followers via AppendEntries (heartbeat)
     if committed_2.is_some() || committed_3.is_some() {

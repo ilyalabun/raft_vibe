@@ -707,12 +707,14 @@ dependencies = [
  "async-trait",
  "axum",
  "futures",
+ "http-body-util",
  "rand",
  "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tower",
 ]
 
 [[package]]

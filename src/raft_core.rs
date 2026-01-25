@@ -138,6 +138,8 @@ pub struct RaftCore {
     pub peers: Vec<u64>,
     /// Peers that have granted votes in the current election (used by candidates)
     votes_received: Vec<u64>,
+    /// Current known leader (updated when receiving valid AppendEntries)
+    pub current_leader: Option<u64>,
 }
 
 impl RaftCore {
@@ -168,6 +170,7 @@ impl RaftCore {
             state: RaftState::Follower,
             peers,
             votes_received: Vec::new(),
+            current_leader: None,
         }
     }
 
@@ -297,6 +300,7 @@ impl RaftCore {
         } else {
             // Valid AppendEntries from current leader - reset election timeout
             self.state = RaftState::Follower;
+            self.current_leader = Some(append_req.leader_id);
             event = RaftEvent::ResetElectionTimeout;
             leader_id = Some(append_req.leader_id);
 
@@ -387,6 +391,9 @@ impl RaftCore {
         // Transition to candidate
         self.state = RaftState::Candidate;
 
+        // Clear current leader (we're challenging)
+        self.current_leader = None;
+
         // Vote for self and persist
         self.set_voted_for(Some(self.id));
 
@@ -401,7 +408,8 @@ impl RaftCore {
     /// Become leader (called after receiving majority of votes)
     pub fn become_leader(&mut self) {
         self.state = RaftState::Leader;
-        
+        self.current_leader = Some(self.id);
+
         // Reinitialize next_index and match_index
         let last_index = self.last_log_index();
         for peer_id in &self.peers {
@@ -430,13 +438,16 @@ impl RaftCore {
 
     /// Apply committed entries to the state machine
     /// Updates last_applied to match commit_index
-    pub fn apply_committed_entries(&mut self) {
+    /// Returns vec of (index, result) for each entry applied
+    pub fn apply_committed_entries(&mut self) -> Vec<(u64, Result<String, String>)> {
+        let mut results = Vec::new();
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             let entry = &self.log[(self.last_applied - 1) as usize];
-            // TODO: collect results for client response
-            let _ = self.state_machine.apply(&entry.command);
+            let result = self.state_machine.apply(&entry.command);
+            results.push((self.last_applied, result));
         }
+        results
     }
 
     /// Process a RequestVote response (called by candidate)
@@ -490,19 +501,19 @@ impl RaftCore {
 
     /// Handle an AppendEntries result (called by leader after receiving replication response)
     /// Processes the response, updates term if needed, tracks replication, and commits entries if majority reached
-    /// Returns the index of the highest committed entry (if any new entry was committed), or None
+    /// Returns (committed_index, apply_results) - the commit index and results from applying entries
     pub fn handle_append_entries_result(
         &mut self,
         peer_id: u64,
         entry_index: u64,
         result: &AppendEntriesResult,
-    ) -> Option<u64> {
+    ) -> (Option<u64>, Vec<(u64, Result<String, String>)>) {
         // Process the response (updates term if needed)
         self.process_append_entries_response(result);
 
         // If we're no longer a leader (e.g., term was updated), we can't commit
         if self.state != RaftState::Leader {
-            return None;
+            return (None, Vec::new());
         }
 
         // Update match_index and next_index based on result
@@ -526,14 +537,14 @@ impl RaftCore {
 
         // Check if entry_index is replicated to majority and can be committed
         if entry_index == 0 {
-            return None; // No entry to commit
+            return (None, Vec::new()); // No entry to commit
         }
 
         // Raft safety: Only commit entries from current term (Section 5.4.2)
         // Previous term entries are committed indirectly when a current-term entry is committed
         let entry_term = self.log.get((entry_index - 1) as usize).map(|e| e.term);
         if entry_term != Some(self.current_term) {
-            return None; // Cannot commit entries from previous terms directly
+            return (None, Vec::new()); // Cannot commit entries from previous terms directly
         }
 
         // Count how many nodes have replicated this entry (including leader)
@@ -551,11 +562,11 @@ impl RaftCore {
         if replicated_count >= majority && entry_index > self.commit_index {
             // Commit the entry
             self.commit_index = entry_index;
-            self.apply_committed_entries();
-            return Some(entry_index);
+            let apply_results = self.apply_committed_entries();
+            return (Some(entry_index), apply_results);
         }
 
-        None
+        (None, Vec::new())
     }
 }
 
@@ -1258,7 +1269,7 @@ mod tests {
             term: 1,
             success: true,
         };
-        let committed = leader.handle_append_entries_result(2, 1, &result);
+        let (committed, _) = leader.handle_append_entries_result(2, 1, &result);
 
         assert!(committed.is_none());
         assert_eq!(leader.commit_index, 0); // Not committed yet
@@ -1281,11 +1292,11 @@ mod tests {
         };
 
         // Peer 2 replicates (2 total)
-        let committed = leader.handle_append_entries_result(2, 1, &result);
+        let (committed, _) = leader.handle_append_entries_result(2, 1, &result);
         assert!(committed.is_none());
 
         // Peer 3 replicates (3 total = majority in 5-node cluster)
-        let committed = leader.handle_append_entries_result(3, 1, &result);
+        let (committed, _) = leader.handle_append_entries_result(3, 1, &result);
         assert_eq!(committed, Some(1));
         assert_eq!(leader.commit_index, 1);
     }
@@ -1311,7 +1322,7 @@ mod tests {
         };
 
         // Peer 2 replicates up to index 3
-        let committed = leader.handle_append_entries_result(2, 3, &result);
+        let (committed, _) = leader.handle_append_entries_result(2, 3, &result);
 
         // Should commit all 3 entries (leader + peer2 = majority)
         assert_eq!(committed, Some(3));
@@ -1335,7 +1346,7 @@ mod tests {
             term: 5,
             success: false,
         };
-        let committed = leader.handle_append_entries_result(2, 1, &result);
+        let (committed, _) = leader.handle_append_entries_result(2, 1, &result);
 
         // Should step down and not commit
         assert!(committed.is_none());
@@ -1395,7 +1406,7 @@ mod tests {
             term: 2,
             success: true,
         };
-        let committed = leader.handle_append_entries_result(2, 1, &result);
+        let (committed, _) = leader.handle_append_entries_result(2, 1, &result);
 
         // Should NOT commit entry from previous term directly
         // (This test documents the expected behavior per Raft paper)
@@ -1431,7 +1442,7 @@ mod tests {
             term: 2,
             success: true,
         };
-        let committed = leader.handle_append_entries_result(2, 2, &result);
+        let (committed, _) = leader.handle_append_entries_result(2, 2, &result);
 
         // Entry 2 (current term) committed, which indirectly commits entry 1
         assert_eq!(committed, Some(2));
@@ -1728,7 +1739,7 @@ mod tests {
             term: 3,
             success: true,
         };
-        let _committed = leader.handle_append_entries_result(2, 1, &stale_result);
+        let _ = leader.handle_append_entries_result(2, 1, &stale_result);
 
         // Should still process (term is lower, so no step-down)
         // Entry should be counted for commit

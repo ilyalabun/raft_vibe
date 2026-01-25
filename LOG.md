@@ -291,11 +291,38 @@ Build initially failed because reqwest defaults to native-tls which requires Ope
 
 Added 4 tests for the HTTP transport covering request_vote, append_entries, timeout handling (connecting to non-existent server), and node not found errors. All 126 tests pass.
 
+## Day 9 (continued): Client HTTP API
+
+**Prompt:** "ok, let's do client http api"
+
+**Tracking Current Leader**
+
+Added `current_leader: Option<u64>` field to RaftCore to track the known leader. This is updated when receiving valid AppendEntries from a leader, cleared when starting an election (challenging leadership), and set to self when becoming leader. This allows followers to provide leader hints to clients.
+
+**Propagating State Machine Results**
+
+Redesigned the command flow to return state machine results instead of just log indices. Modified `apply_committed_entries()` to return `Vec<(u64, Result<String, String>)>` containing index and result for each applied entry. Updated `handle_append_entries_result()` to return `(Option<u64>, Vec<...>)` - both the commit index and apply results. Modified `replicate_to_peers()` to return `Option<Result<String, String>>` - the result for the specific submitted entry if committed.
+
+**Updated RaftError**
+
+Extended `RaftError` enum with new variants: `NotLeader { leader_hint: Option<u64> }` includes a hint about who the leader is, `NotCommitted` for when an entry couldn't be committed to majority, and `StateMachine(String)` for state machine errors.
+
+**Client HTTP Endpoints**
+
+Created `client_http.rs` with three endpoints:
+- `POST /client/submit` - Submit a command to the cluster. Returns state machine result or error with leader hint.
+- `GET /client/leader` - Query current leader info (leader_id, node_id, is_leader).
+- `GET /client/status` - Get node status (state, term, commit_index, last_applied, log_length).
+
+**Testing**
+
+Added 6 tests for the client HTTP API covering: submit when not leader, submit as leader, leader endpoint for follower/leader, status endpoint, and leader hint in error responses. All 132 tests pass.
+
 ---
 
 ## Next Up
 
-- **Day 9 (continued):** Client API - Add proper client command handling with results from state machine
+- **Day 10:** Full integration - Wire up client HTTP with RaftServer for complete request flow
 
 ---
 
