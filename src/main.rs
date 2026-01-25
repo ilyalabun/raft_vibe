@@ -13,6 +13,7 @@ mod storage;
 mod storage_file;
 mod storage_memory;
 mod transport;
+mod transport_http;
 mod transport_inmemory;
 
 use raft_core::{RaftCore, RequestVoteArgs, AppendEntriesArgs};

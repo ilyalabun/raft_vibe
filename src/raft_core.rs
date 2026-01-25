@@ -33,7 +33,7 @@ pub struct LogEntry {
 }
 
 /// RequestVote RPC arguments
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestVoteArgs {
     /// Candidate's term
     pub term: u64,
@@ -46,7 +46,7 @@ pub struct RequestVoteArgs {
 }
 
 /// RequestVote RPC results
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestVoteResult {
     /// Current term, for candidate to update itself
     pub term: u64,
@@ -55,7 +55,7 @@ pub struct RequestVoteResult {
 }
 
 /// AppendEntries RPC arguments
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendEntriesArgs {
     /// Leader's term
     pub term: u64,
@@ -72,7 +72,7 @@ pub struct AppendEntriesArgs {
 }
 
 /// AppendEntries RPC results
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendEntriesResult {
     /// Current term, for leader to update itself
     pub term: u64,

@@ -263,11 +263,39 @@ Created `KeyValueStore` in `state_machine_kv.rs` - a simple in-memory key-value 
 
 Updated `RaftCore` to hold a `Box<dyn StateMachine>` alongside the storage. Modified `apply_committed_entries()` to actually call the state machine's `apply()` method when entries are committed. `TestStateMachine` uses `Arc<Mutex<Vec<String>>>` to allow tests to verify exactly which commands were applied. Added integration tests verifying: (1) commands are applied to state machine when quorum is reached, (2) commands are NOT applied when leader is partitioned, and (3) followers apply commands after receiving heartbeat with updated commit_index. Test suite now has 122 tests.
 
+## Day 9: HTTP Transport
+
+**Prompt:** "ok, today I want to work on http transport"
+
+**Choosing HTTP Stack**
+
+Decided to use axum (from the Tokio team) for the HTTP server and reqwest for the HTTP client, with JSON serialization via serde. This combination is well-supported in the Rust async ecosystem and provides a clean API for building HTTP services.
+
+**Implementing HttpTransport**
+
+Created `transport_http.rs` with a complete HTTP transport implementation:
+- `HttpTransport` struct implementing the `Transport` trait, holding a map of peer addresses and a reqwest client with configurable timeout
+- Two endpoints: `POST /raft/request_vote` and `POST /raft/append_entries`
+- axum router with shared state (`SharedCore = Arc<Mutex<RaftCore>>`) for handling incoming RPCs
+- Proper error mapping from reqwest errors to `TransportError` (timeout vs connection failed)
+
+**Adding Serde to RPC Types**
+
+Added `Serialize, Deserialize` derives to all RPC message types in `raft_core.rs` (`RequestVoteArgs`, `RequestVoteResult`, `AppendEntriesArgs`, `AppendEntriesResult`) to enable JSON serialization over HTTP.
+
+**TLS Backend Decision**
+
+Build initially failed because reqwest defaults to native-tls which requires OpenSSL system libraries. Chose rustls-tls instead for several reasons: it's memory-safe (written in Rust), has no system dependencies (pure Rust), has a smaller attack surface than OpenSSL, and refuses deprecated protocols by default. Updated Cargo.toml to use `reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }`.
+
+**Testing**
+
+Added 4 tests for the HTTP transport covering request_vote, append_entries, timeout handling (connecting to non-existent server), and node not found errors. All 126 tests pass.
+
 ---
 
 ## Next Up
 
-- **Day 9: Client API** - Add proper client command handling with results from state machine
+- **Day 9 (continued):** Client API - Add proper client command handling with results from state machine
 
 ---
 
