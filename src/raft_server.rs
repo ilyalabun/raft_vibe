@@ -2,7 +2,7 @@
 
 use std::pin::pin;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{interval, sleep_until, Instant};
+use tokio::time::{interval, sleep_until, Duration, Instant};
 
 use crate::config::RaftConfig;
 use crate::raft_node::{RaftNode, SharedCore};
@@ -30,16 +30,6 @@ enum Command {
         reply: oneshot::Sender<Result<String, RaftError>>,
     },
 }
-
-/// Events that can be sent to the server loop
-#[derive(Debug, Clone)]
-pub enum ServerEvent {
-    /// Reset the election timeout (received valid heartbeat from leader)
-    ResetElectionTimeout,
-}
-
-/// Sender for server events (used by transport layer to notify server)
-pub type EventSender = mpsc::Sender<ServerEvent>;
 
 /// Handle for interacting with a running RaftServer
 #[derive(Clone)]
@@ -69,32 +59,29 @@ pub struct RaftServer<T: Transport> {
     node: RaftNode<T>,
     command_rx: mpsc::Receiver<Command>,
     command_tx: mpsc::Sender<Command>,
-    event_rx: mpsc::Receiver<ServerEvent>,
     config: RaftConfig,
 }
 
 impl<T: Transport + 'static> RaftServer<T> {
     /// Create a new RaftServer with default config
-    /// Returns the server, shared core for RPC handling, and event sender for timeout resets
-    pub fn new(core: RaftCore, transport: T) -> (Self, SharedCore, EventSender) {
+    /// Returns the server and shared core for RPC handling
+    pub fn new(core: RaftCore, transport: T) -> (Self, SharedCore) {
         Self::with_config(core, transport, RaftConfig::default())
     }
 
     /// Create a new RaftServer with custom config
-    /// Returns the server, shared core for RPC handling, and event sender for timeout resets
-    pub fn with_config(core: RaftCore, transport: T, config: RaftConfig) -> (Self, SharedCore, EventSender) {
+    /// Returns the server and shared core for RPC handling
+    pub fn with_config(core: RaftCore, transport: T, config: RaftConfig) -> (Self, SharedCore) {
         let (command_tx, command_rx) = mpsc::channel(32);
-        let (event_tx, event_rx) = mpsc::channel(32);
         let node = RaftNode::new(core, transport);
         let shared_core = node.shared_core();
         let server = Self {
             node,
             command_rx,
             command_tx,
-            event_rx,
             config,
         };
-        (server, shared_core, event_tx)
+        (server, shared_core)
     }
 
     /// Start the server and return a handle for interaction
@@ -111,10 +98,12 @@ impl<T: Transport + 'static> RaftServer<T> {
     /// Main server loop
     async fn run(mut self) {
         let mut heartbeat_interval = interval(self.config.heartbeat_interval);
-        let mut election_deadline = Instant::now() + self.config.random_election_timeout();
+        // Use a fixed election timeout duration for this server instance
+        let election_timeout = self.config.random_election_timeout();
 
         loop {
-            // Create a fresh sleep future each iteration that will fire at election_deadline
+            // Calculate election deadline based on last_heartbeat from core
+            let election_deadline = self.get_election_deadline(election_timeout).await;
             let election_sleep = pin!(sleep_until(election_deadline));
 
             tokio::select! {
@@ -124,15 +113,6 @@ impl<T: Transport + 'static> RaftServer<T> {
                         Command::Submit { command, reply } => {
                             let result = self.handle_submit(command).await;
                             let _ = reply.send(result);
-                        }
-                    }
-                }
-                // Handle events from transport layer (e.g., heartbeat received)
-                Some(event) = self.event_rx.recv() => {
-                    match event {
-                        ServerEvent::ResetElectionTimeout => {
-                            // Update deadline - next iteration will create new sleep with this deadline
-                            election_deadline = Instant::now() + self.config.random_election_timeout();
                         }
                     }
                 }
@@ -146,21 +126,36 @@ impl<T: Transport + 'static> RaftServer<T> {
                 _ = election_sleep => {
                     let state = self.node.state().await;
                     if state != RaftState::Leader {
-                        // Start election
-                        self.node.start_election().await;
-                        let became_leader = self.node.request_votes().await;
+                        // Check if we actually timed out (last_heartbeat might have been updated)
+                        if self.has_election_timed_out(election_timeout).await {
+                            // Start election
+                            self.node.start_election().await;
+                            let became_leader = self.node.request_votes().await;
 
-                        if became_leader {
-                            // Immediately send heartbeat to establish leadership
-                            self.node.send_heartbeat().await;
+                            if became_leader {
+                                // Immediately send heartbeat to establish leadership
+                                self.node.send_heartbeat().await;
+                            }
                         }
                     }
-                    // Reset election timeout for next iteration
-                    election_deadline = Instant::now() + self.config.random_election_timeout();
                 }
                 else => break, // All channels closed, shutdown
             }
         }
+    }
+
+    /// Get election deadline based on last_heartbeat from core
+    async fn get_election_deadline(&self, timeout: Duration) -> Instant {
+        let core = self.node.shared_core();
+        let last_heartbeat = core.lock().await.last_heartbeat;
+        last_heartbeat + timeout
+    }
+
+    /// Check if election has actually timed out (last_heartbeat + timeout < now)
+    async fn has_election_timed_out(&self, timeout: Duration) -> bool {
+        let core = self.node.shared_core();
+        let last_heartbeat = core.lock().await.last_heartbeat;
+        Instant::now() >= last_heartbeat + timeout
     }
 
     /// Handle a client submit command
@@ -248,7 +243,7 @@ mod tests {
         let core1 = new_test_core(1, vec![2, 3]);
         let transport1 = transports.remove(&1).unwrap();
 
-        let (server, _shared_core, _event_tx) = RaftServer::new(core1, transport1);
+        let (server, _shared_core, ) = RaftServer::new(core1, transport1);
         let handle = server.start();
 
         // Node is not leader, should fail
@@ -267,7 +262,7 @@ mod tests {
 
         let transport1 = transports.remove(&1).unwrap();
 
-        let (server1, _shared1, _event_tx) = RaftServer::new(core1, transport1);
+        let (server1, _shared1, ) = RaftServer::new(core1, transport1);
         let shared2 = Arc::new(Mutex::new(core2));
         let shared3 = Arc::new(Mutex::new(core3));
 
@@ -299,7 +294,7 @@ mod tests {
 
         let transport1 = transports.remove(&1).unwrap();
 
-        let (server1, shared1, _event_tx) = RaftServer::new(core1, transport1);
+        let (server1, shared1, ) = RaftServer::new(core1, transport1);
         let shared2 = Arc::new(Mutex::new(core2));
         let shared3 = Arc::new(Mutex::new(core3));
 
@@ -350,7 +345,7 @@ mod tests {
         let config = RaftConfig::default()
             .with_election_timeout(Duration::from_millis(300), Duration::from_millis(500));
 
-        let (server1, shared1, _event_tx) = RaftServer::with_config(core1, transport1, config);
+        let (server1, shared1, ) = RaftServer::with_config(core1, transport1, config);
         let shared2 = Arc::new(Mutex::new(core2));
         let shared3 = Arc::new(Mutex::new(core3));
 
@@ -402,7 +397,7 @@ mod tests {
         let config = RaftConfig::default()
             .with_election_timeout(Duration::from_millis(300), Duration::from_millis(500));
 
-        let (server1, shared1, _event_tx) = RaftServer::with_config(core1, transport1, config);
+        let (server1, shared1, ) = RaftServer::with_config(core1, transport1, config);
 
         // Verify node starts as follower at term 0
         assert_eq!(shared1.lock().await.state, RaftState::Follower);
@@ -446,7 +441,7 @@ mod tests {
         let config = RaftConfig::default()
             .with_election_timeout(Duration::from_secs(100), Duration::from_secs(100));
 
-        let (server1, shared1, _event_tx) = RaftServer::with_config(core1, transport1, config);
+        let (server1, shared1, ) = RaftServer::with_config(core1, transport1, config);
         let shared2 = Arc::new(Mutex::new(core2));
         let shared3 = Arc::new(Mutex::new(core3));
 
@@ -520,7 +515,7 @@ mod tests {
         let config = RaftConfig::default()
             .with_election_timeout(Duration::from_secs(100), Duration::from_secs(100));
 
-        let (server1, shared1, _event_tx) = RaftServer::with_config(core1, transport1, config);
+        let (server1, shared1, ) = RaftServer::with_config(core1, transport1, config);
         let shared2 = Arc::new(Mutex::new(core2));
         let shared3 = Arc::new(Mutex::new(core3));
 
@@ -595,8 +590,8 @@ mod tests {
         let transport1 = transports.remove(&1).unwrap();
         let transport2 = transports.remove(&2).unwrap();
 
-        let (server1, shared1, _) = RaftServer::new(core1, transport1);
-        let (server2, shared2, _) = RaftServer::new(core2, transport2);
+        let (server1, shared1) = RaftServer::new(core1, transport1);
+        let (server2, shared2) = RaftServer::new(core2, transport2);
         let shared3 = Arc::new(Mutex::new(core3));
 
         let mut handle2 = handles.remove(&2).unwrap();
@@ -660,7 +655,7 @@ mod tests {
 
         let transport1 = transports.remove(&1).unwrap();
 
-        let (server1, shared1, _) = RaftServer::new(core1, transport1);
+        let (server1, shared1) = RaftServer::new(core1, transport1);
         let shared2 = Arc::new(Mutex::new(core2));
         let shared3 = Arc::new(Mutex::new(core3));
 
@@ -707,8 +702,8 @@ mod tests {
         let transport1 = transports.remove(&1).unwrap();
         let transport2 = transports.remove(&2).unwrap();
 
-        let (server1, shared1, _) = RaftServer::new(core1, transport1);
-        let (server2, shared2, _) = RaftServer::new(core2, transport2);
+        let (server1, shared1) = RaftServer::new(core1, transport1);
+        let (server2, shared2) = RaftServer::new(core2, transport2);
         let shared3 = Arc::new(Mutex::new(core3));
 
         let mut handle3 = handles.remove(&3).unwrap();
@@ -756,7 +751,7 @@ mod tests {
 
         let transport1 = transports.remove(&1).unwrap();
 
-        let (server1, shared1, _) = RaftServer::new(core1, transport1);
+        let (server1, shared1) = RaftServer::new(core1, transport1);
         let shared2 = Arc::new(Mutex::new(core2));
         let shared3 = Arc::new(Mutex::new(core3));
 
@@ -818,8 +813,8 @@ mod tests {
         let transport1 = transports.remove(&1).unwrap();
         let transport2 = transports.remove(&2).unwrap();
 
-        let (server1, shared1, _) = RaftServer::new(core1, transport1);
-        let (server2, shared2, _) = RaftServer::new(core2, transport2);
+        let (server1, shared1) = RaftServer::new(core1, transport1);
+        let (server2, shared2) = RaftServer::new(core2, transport2);
         let shared3 = Arc::new(Mutex::new(core3));
 
         let mut handle2 = handles.remove(&2).unwrap();
@@ -873,7 +868,7 @@ mod tests {
         let config = RaftConfig::default()
             .with_election_timeout(Duration::from_secs(100), Duration::from_secs(100));
 
-        let (server1, shared1, _) = RaftServer::with_config(core1, transport1, config);
+        let (server1, shared1) = RaftServer::with_config(core1, transport1, config);
 
         // Start election but don't let it complete (no peers respond)
         server1.start_election().await;
@@ -919,7 +914,7 @@ mod tests {
         let config = RaftConfig::default()
             .with_election_timeout(Duration::from_secs(100), Duration::from_secs(100));
 
-        let (server1, shared1, _) = RaftServer::with_config(core1, transport1, config);
+        let (server1, shared1) = RaftServer::with_config(core1, transport1, config);
         let shared3 = Arc::new(Mutex::new(core3));
 
         let mut handle2 = handles.remove(&2).unwrap();
@@ -981,7 +976,7 @@ mod tests {
         let config = RaftConfig::default()
             .with_election_timeout(Duration::from_secs(100), Duration::from_secs(100));
 
-        let (server1, shared1, _) = RaftServer::with_config(core1, transport1, config);
+        let (server1, shared1) = RaftServer::with_config(core1, transport1, config);
         let shared2 = Arc::new(Mutex::new(core2));
         let shared3 = Arc::new(Mutex::new(core3));
 
@@ -1050,7 +1045,7 @@ mod tests {
 
         let transport1 = transports.remove(&1).unwrap();
 
-        let (server1, shared1, _) = RaftServer::new(core1, transport1);
+        let (server1, shared1) = RaftServer::new(core1, transport1);
         let shared2 = Arc::new(Mutex::new(core2));
         let shared3 = Arc::new(Mutex::new(core3));
 
@@ -1110,7 +1105,7 @@ mod tests {
             .with_election_timeout(Duration::from_secs(100), Duration::from_secs(100))
             .with_heartbeat_interval(Duration::from_millis(50));
 
-        let (server1, shared1, _) = RaftServer::with_config(core1, transport1, config);
+        let (server1, shared1) = RaftServer::with_config(core1, transport1, config);
         let shared2 = Arc::new(Mutex::new(core2));
         let shared3 = Arc::new(Mutex::new(core3));
 

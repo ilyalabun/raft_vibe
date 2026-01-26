@@ -318,11 +318,58 @@ Created `client_http.rs` with three endpoints:
 
 Added 6 tests for the client HTTP API covering: submit when not leader, submit as leader, leader endpoint for follower/leader, status endpoint, and leader hint in error responses. All 132 tests pass.
 
+## Day 10: Election Timeout Refactoring and Cluster Management
+
+**Prompt:** "we were refactoring raft_core and raft_server to encapsulate leader election timeout event"
+
+**Encapsulating Election Timeout in RaftCore**
+
+Refactored election timeout handling to be fully encapsulated within `RaftCore`. Changed `last_heartbeat` from `std::time::Instant` to `tokio::time::Instant` to enable time mocking in tests. Instead of returning a `RaftEvent` from `handle_append_entries()`, the method now directly updates `last_heartbeat = Instant::now()`. Removed the `RaftEvent` enum entirely. Updated `start_election()` to also reset `last_heartbeat` to prevent infinite election loops when elections timeout repeatedly.
+
+**Simplifying RaftServer**
+
+Removed the `ServerEvent` channel mechanism from `RaftServer`. The server loop now checks `last_heartbeat` directly via `get_election_deadline()` and `has_election_timed_out()` helper methods. This removes complexity and keeps timing logic consolidated - the server queries RaftCore's state rather than receiving events.
+
+**Prompt:** "can you add killnode and startnode options to run_cluster.sh?"
+
+**Cluster Management Commands**
+
+Enhanced `run_cluster.sh` with commands for simulating node failures:
+- `killnode <id>` - Kill a specific node (1, 2, or 3)
+- `startnode <id>` - Restart a killed node with preserved data directory
+- `watchlogs` - Tail all logs in a single stream with colored output (Node 1=Blue, Node 2=Green, Node 3=Yellow)
+
+**Prompt:** "I want you to print [NODE X] in node's logs"
+
+**Adding Logging to Raft Operations**
+
+Added logging throughout the Raft implementation with `[NODE X]` prefix:
+- Leadership changes: "Became CANDIDATE", "Became LEADER", "Stepped down to FOLLOWER"
+- Log appends: "Appended entry..." (leader) and "Replicated entry..." (follower)
+- Commits: "Committed entry..."
+- Updated `server.rs` startup messages to also use the prefix
+
+**Prompt:** "I also need http endpoints to read state machine state"
+
+**KV Read Endpoints**
+
+Added HTTP endpoints to read state machine state directly:
+- `GET /client/get/{key}` - Get a single key's value
+- `GET /client/kv` - Dump entire key-value state as JSON
+
+Created `SharedKvStore = Arc<Mutex<KeyValueStore>>` to share state machine between Raft and HTTP handlers. Implemented `StateMachine` trait for `SharedKvStore` to delegate to the inner store. Updated `server.rs` to use shared state machine and added the new routes.
+
+**Prompt:** "I noticed that when cluster starts state machine is empty"
+
+**Discovered State Machine Recovery Issue**
+
+Identified a known Raft issue: on restart, the state machine is empty until a write happens because `commit_index` starts at 0 (it's volatile state) and leaders can only commit entries from the current term. The proper Raft solution is to append a no-op entry when a leader is elected, which commits all prior entries indirectly. This is a future enhancement.
+
 ---
 
 ## Next Up
 
-- **Day 10:** Full integration - Wire up client HTTP with RaftServer for complete request flow
+- **Day 11:** Implement no-op entry on leader election to fix state machine recovery
 
 ---
 

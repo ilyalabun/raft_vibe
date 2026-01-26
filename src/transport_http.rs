@@ -125,8 +125,6 @@ async fn handle_append_entries(
 ) -> (StatusCode, Json<AppendEntriesResult>) {
     let mut core = core.lock().await;
     let output = core.handle_append_entries(&args);
-    // Note: We're ignoring the RaftEvent here for now
-    // In a full implementation, we'd signal the server to reset election timeout
     (StatusCode::OK, Json(output.result))
 }
 

@@ -4,6 +4,7 @@
 //! "In Search of an Understandable Consensus Algorithm" by Diego Ongaro and John Ousterhout
 
 use std::collections::HashMap;
+use tokio::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -80,23 +81,11 @@ pub struct AppendEntriesResult {
     pub success: bool,
 }
 
-/// Events that can be triggered by handling RPCs
-/// Used to communicate actions the server layer should take
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RaftEvent {
-    /// Reset the election timeout (received valid heartbeat/append from leader)
-    ResetElectionTimeout,
-    /// No action needed
-    None,
-}
-
-/// Result of handling an AppendEntries RPC, includes both the response and any events
+/// Result of handling an AppendEntries RPC
 #[derive(Debug, Clone)]
 pub struct HandleAppendEntriesOutput {
     /// The response to send back to the leader
     pub result: AppendEntriesResult,
-    /// Event triggered by this RPC (e.g., reset election timeout)
-    pub event: RaftEvent,
     /// Leader ID if we recognized a valid leader
     pub leader_id: Option<u64>,
 }
@@ -140,6 +129,8 @@ pub struct RaftCore {
     votes_received: Vec<u64>,
     /// Current known leader (updated when receiving valid AppendEntries)
     pub current_leader: Option<u64>,
+    /// Last time we received a valid heartbeat from leader (for election timeout)
+    pub last_heartbeat: Instant,
 }
 
 impl RaftCore {
@@ -171,6 +162,7 @@ impl RaftCore {
             peers,
             votes_received: Vec::new(),
             current_leader: None,
+            last_heartbeat: Instant::now(),
         }
     }
 
@@ -253,8 +245,12 @@ impl RaftCore {
 
         // If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
         if vote_req.term > self.current_term {
+            let old_state = self.state;
             self.update_term(vote_req.term);
             self.state = RaftState::Follower;
+            if old_state != RaftState::Follower {
+                println!("[NODE {}] Stepped down to FOLLOWER (was {:?}, saw term {})", self.id, old_state, vote_req.term);
+            }
         }
 
         // If already voted for another candidate, decline vote
@@ -282,16 +278,18 @@ impl RaftCore {
     }
 
     /// Handle AppendEntries RPC (heartbeat or log replication)
-    /// Returns the result to send back, plus any events the server should handle
+    /// Returns the result to send back and the leader ID if recognized
     pub fn handle_append_entries(&mut self, append_req: &AppendEntriesArgs) -> HandleAppendEntriesOutput {
         // If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
         if append_req.term > self.current_term {
+            let old_state = self.state;
             self.update_term(append_req.term);
             self.state = RaftState::Follower;
+            if old_state != RaftState::Follower {
+                println!("[NODE {}] Stepped down to FOLLOWER (was {:?}, saw term {} from leader {})", self.id, old_state, append_req.term, append_req.leader_id);
+            }
         }
 
-        // Track whether we should reset election timeout and who the leader is
-        let mut event = RaftEvent::None;
         let mut leader_id = None;
 
         let success = if append_req.term < self.current_term {
@@ -301,7 +299,7 @@ impl RaftCore {
             // Valid AppendEntries from current leader - reset election timeout
             self.state = RaftState::Follower;
             self.current_leader = Some(append_req.leader_id);
-            event = RaftEvent::ResetElectionTimeout;
+            self.last_heartbeat = Instant::now();
             leader_id = Some(append_req.leader_id);
 
             // Reply false if log doesn't contain an entry at prev_log_index with term matching prev_log_term
@@ -357,7 +355,6 @@ impl RaftCore {
                 term: self.current_term,
                 success,
             },
-            event,
             leader_id,
         }
     }
@@ -374,11 +371,13 @@ impl RaftCore {
                     // Delete this entry and all that follow, then append new entry
                     self.persist_truncate_log(entry.index);
                     self.persist_log_entry(entry.clone());
+                    println!("[NODE {}] Replicated entry {} (term {}): {}", self.id, entry.index, entry.term, entry.command);
                 }
                 // If terms match, entry already exists - skip (idempotent)
             } else {
                 // Entry doesn't exist yet, append it
                 self.persist_log_entry(entry.clone());
+                println!("[NODE {}] Replicated entry {} (term {}): {}", self.id, entry.index, entry.term, entry.command);
             }
         }
     }
@@ -390,6 +389,7 @@ impl RaftCore {
 
         // Transition to candidate
         self.state = RaftState::Candidate;
+        println!("[NODE {}] Became CANDIDATE for term {}", self.id, self.current_term);
 
         // Clear current leader (we're challenging)
         self.current_leader = None;
@@ -401,14 +401,15 @@ impl RaftCore {
         self.votes_received.clear();
         self.votes_received.push(self.id);
 
-        // Reset election timer (in real implementation, this would be handled by a timer)
-        // For now, we just update the state
+        // Reset election timer so we don't immediately timeout again
+        self.last_heartbeat = Instant::now();
     }
 
     /// Become leader (called after receiving majority of votes)
     pub fn become_leader(&mut self) {
         self.state = RaftState::Leader;
         self.current_leader = Some(self.id);
+        println!("[NODE {}] Became LEADER for term {}", self.id, self.current_term);
 
         // Reinitialize next_index and match_index
         let last_index = self.last_log_index();
@@ -430,8 +431,9 @@ impl RaftCore {
         let entry = LogEntry {
             term: self.current_term,
             index,
-            command,
+            command: command.clone(),
         };
+        println!("[NODE {}] Appended entry {} (term {}): {}", self.id, index, self.current_term, command);
         self.persist_log_entry(entry.clone());
         Some(entry)
     }
@@ -455,8 +457,12 @@ impl RaftCore {
     pub fn process_request_vote_response(&mut self, result: &RequestVoteResult) {
         // If RPC response contains term T > currentTerm: set currentTerm = T, convert to follower
         if result.term > self.current_term {
+            let old_state = self.state;
             self.update_term(result.term);
             self.state = RaftState::Follower;
+            if old_state != RaftState::Follower {
+                println!("[NODE {}] Stepped down to FOLLOWER (was {:?}, saw term {} in vote response)", self.id, old_state, result.term);
+            }
         }
     }
 
@@ -465,8 +471,12 @@ impl RaftCore {
     pub fn process_append_entries_response(&mut self, result: &AppendEntriesResult) {
         // If RPC response contains term T > currentTerm: set currentTerm = T, convert to follower
         if result.term > self.current_term {
+            let old_state = self.state;
             self.update_term(result.term);
             self.state = RaftState::Follower;
+            if old_state != RaftState::Follower {
+                println!("[NODE {}] Stepped down to FOLLOWER (was {:?}, saw term {} in append response)", self.id, old_state, result.term);
+            }
         }
     }
 
@@ -562,6 +572,7 @@ impl RaftCore {
         if replicated_count >= majority && entry_index > self.commit_index {
             // Commit the entry
             self.commit_index = entry_index;
+            println!("[NODE {}] Committed entry {} (replicated to {}/{})", self.id, entry_index, replicated_count, total_nodes);
             let apply_results = self.apply_committed_entries();
             return (Some(entry_index), apply_results);
         }
@@ -632,12 +643,13 @@ mod tests {
             }],
             leader_commit: 0,
         };
+        let before = node.last_heartbeat;
         let output = node.handle_append_entries(&args);
         assert!(output.result.success);
-        assert_eq!(output.event, RaftEvent::ResetElectionTimeout);
         assert_eq!(output.leader_id, Some(2));
         assert_eq!(node.log.len(), 1);
         assert_eq!(node.state, RaftState::Follower);
+        assert!(node.last_heartbeat >= before, "last_heartbeat should be updated");
     }
 
     #[test]
@@ -645,6 +657,7 @@ mod tests {
         let mut node = new_test_core(1, vec![2, 3]);
         // Node is at term 2
         node.current_term = 2;
+        let before = node.last_heartbeat;
 
         // Receive AppendEntries from stale term 1
         let args = AppendEntriesArgs {
@@ -659,13 +672,14 @@ mod tests {
 
         // Should reject and NOT reset election timeout
         assert!(!output.result.success);
-        assert_eq!(output.event, RaftEvent::None);
         assert_eq!(output.leader_id, None);
+        assert_eq!(node.last_heartbeat, before, "last_heartbeat should NOT be updated for stale term");
     }
 
     #[test]
     fn test_heartbeat_resets_election_timeout() {
         let mut node = new_test_core(1, vec![2, 3]);
+        let before = node.last_heartbeat;
 
         // Receive empty heartbeat
         let args = AppendEntriesArgs {
@@ -680,8 +694,8 @@ mod tests {
 
         // Heartbeat should succeed and reset timeout
         assert!(output.result.success);
-        assert_eq!(output.event, RaftEvent::ResetElectionTimeout);
         assert_eq!(output.leader_id, Some(2));
+        assert!(node.last_heartbeat >= before, "last_heartbeat should be updated");
     }
 
     // === Vote Rejection Tests ===

@@ -3,6 +3,10 @@ name = "raft_vibe"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "raft-server"
+path = "src/bin/server.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time", "test-util"] }
 async-trait = "0.1"

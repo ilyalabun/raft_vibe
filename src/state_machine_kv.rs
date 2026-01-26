@@ -7,6 +7,7 @@
 //! For reads, use the `get()` method directly (bypasses Raft log).
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::state_machine::{ApplyResult, StateMachine};
 
@@ -24,9 +25,22 @@ impl KeyValueStore {
     }
 
     /// Get a value directly (for read-only queries, bypasses Raft)
-    #[allow(dead_code)]
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.data.get(key).map(|s| s.as_str())
+    pub fn get(&self, key: &str) -> Option<String> {
+        self.data.get(key).cloned()
+    }
+
+    /// Get all key-value pairs
+    pub fn all(&self) -> HashMap<String, String> {
+        self.data.clone()
+    }
+}
+
+/// Shared key-value store that can be used for both Raft and direct reads
+pub type SharedKvStore = Arc<Mutex<KeyValueStore>>;
+
+impl StateMachine for SharedKvStore {
+    fn apply(&mut self, command: &str) -> ApplyResult {
+        self.lock().unwrap().apply(command)
     }
 }
 
@@ -61,7 +75,7 @@ mod tests {
 
         let result = kv.apply("SET foo bar");
         assert!(result.is_ok());
-        assert_eq!(kv.get("foo"), Some("bar"));
+        assert_eq!(kv.get("foo"), Some("bar".to_string()));
     }
 
     #[test]
@@ -97,7 +111,7 @@ mod tests {
         kv.apply("SET key value1").unwrap();
         kv.apply("SET key value2").unwrap();
 
-        assert_eq!(kv.get("key"), Some("value2"));
+        assert_eq!(kv.get("key"), Some("value2".to_string()));
     }
 
     #[test]
@@ -107,7 +121,7 @@ mod tests {
         // splitn(3, ' ') ensures value can contain spaces
         kv.apply("SET greeting hello world").unwrap();
 
-        assert_eq!(kv.get("greeting"), Some("hello world"));
+        assert_eq!(kv.get("greeting"), Some("hello world".to_string()));
     }
 
     #[test]

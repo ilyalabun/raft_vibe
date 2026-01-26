@@ -16,9 +16,19 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::raft_core::{RaftCore, RaftState};
+use crate::raft_server::{RaftError, RaftHandle};
 
 /// Shared state for the client HTTP server
 pub type SharedCore = Arc<Mutex<RaftCore>>;
+
+/// State for client HTTP handlers - contains both handle for commands and core for queries
+#[derive(Clone)]
+pub struct ClientState {
+    /// Handle for submitting commands (goes through full RaftServer flow)
+    pub handle: RaftHandle,
+    /// Shared core for reading status/leader info
+    pub core: SharedCore,
+}
 
 /// Request body for submitting a command
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,57 +84,89 @@ pub struct StatusResponse {
     pub log_length: u64,
 }
 
-/// Create an axum router for client HTTP API
+/// Create an axum router for client HTTP API (simplified, core-only version for testing)
 pub fn create_client_router(core: SharedCore) -> Router {
+    Router::new()
+        .route("/client/leader", get(handle_leader_core))
+        .route("/client/status", get(handle_status_core))
+        .with_state(core)
+}
+
+/// Create an axum router for client HTTP API with full RaftServer integration
+pub fn create_client_router_full(handle: RaftHandle, core: SharedCore) -> Router {
+    let state = ClientState { handle, core };
     Router::new()
         .route("/client/submit", post(handle_submit))
         .route("/client/leader", get(handle_leader))
         .route("/client/status", get(handle_status))
-        .with_state(core)
+        .with_state(state)
 }
 
 /// Handle POST /client/submit - submit a command to the Raft cluster
-/// Note: This is a simplified version that only appends to the log.
-/// In a full implementation, we'd wait for commit via RaftServer.
-async fn handle_submit(
-    State(core): State<SharedCore>,
+/// This goes through the full RaftServer flow: append, replicate, commit, apply
+pub async fn handle_submit(
+    State(state): State<ClientState>,
     Json(request): Json<SubmitRequest>,
 ) -> Result<Json<SubmitResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut core = core.lock().await;
-
-    // Only leaders can accept commands
-    if core.state != RaftState::Leader {
-        return Err((
+    match state.handle.submit(request.command).await {
+        Ok(result) => Ok(Json(SubmitResponse { result })),
+        Err(RaftError::NotLeader { leader_hint }) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
                 error: "Not the leader".to_string(),
-                leader_hint: core.current_leader,
+                leader_hint,
             }),
-        ));
-    }
-
-    // Append to local log
-    match core.append_log_entry(request.command) {
-        Some(_entry) => {
-            // Note: In production, we'd wait for replication and return the actual
-            // state machine result. For now, we return a placeholder indicating
-            // the entry was accepted.
-            Ok(Json(SubmitResponse {
-                result: "Entry accepted (pending replication)".to_string(),
-            }))
-        }
-        None => Err((
+        )),
+        Err(RaftError::NotCommitted) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Entry not committed (couldn't reach majority)".to_string(),
+                leader_hint: None,
+            }),
+        )),
+        Err(RaftError::StateMachine(err)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("State machine error: {}", err),
+                leader_hint: None,
+            }),
+        )),
+        Err(RaftError::Transport(_)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: "Failed to append log entry".to_string(),
+                error: "Transport error".to_string(),
                 leader_hint: None,
             }),
         )),
     }
 }
 
-/// Handle GET /client/leader - get current leader information
-async fn handle_leader(State(core): State<SharedCore>) -> Json<LeaderResponse> {
+/// Handle GET /client/leader - get current leader information (full integration)
+pub async fn handle_leader(State(state): State<ClientState>) -> Json<LeaderResponse> {
+    let core = state.core.lock().await;
+    Json(LeaderResponse {
+        leader_id: core.current_leader,
+        node_id: core.id,
+        is_leader: core.state == RaftState::Leader,
+    })
+}
+
+/// Handle GET /client/status - get node status (full integration)
+pub async fn handle_status(State(state): State<ClientState>) -> Json<StatusResponse> {
+    let core = state.core.lock().await;
+    Json(StatusResponse {
+        node_id: core.id,
+        state: format!("{:?}", core.state),
+        term: core.current_term,
+        leader_id: core.current_leader,
+        commit_index: core.commit_index,
+        last_applied: core.last_applied,
+        log_length: core.log.len() as u64,
+    })
+}
+
+/// Handle GET /client/leader - core-only version for testing
+async fn handle_leader_core(State(core): State<SharedCore>) -> Json<LeaderResponse> {
     let core = core.lock().await;
     Json(LeaderResponse {
         leader_id: core.current_leader,
@@ -133,8 +175,8 @@ async fn handle_leader(State(core): State<SharedCore>) -> Json<LeaderResponse> {
     })
 }
 
-/// Handle GET /client/status - get node status
-async fn handle_status(State(core): State<SharedCore>) -> Json<StatusResponse> {
+/// Handle GET /client/status - core-only version for testing
+async fn handle_status_core(State(core): State<SharedCore>) -> Json<StatusResponse> {
     let core = core.lock().await;
     Json(StatusResponse {
         node_id: core.id,
@@ -152,9 +194,12 @@ mod tests {
     use super::*;
     use crate::state_machine::TestStateMachine;
     use crate::storage_memory::MemoryStorage;
+    use crate::raft_server::RaftServer;
+    use crate::transport_inmemory::create_cluster_with_timeout;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
+    use std::time::Duration;
     use tower::util::ServiceExt;
 
     fn new_test_core(id: u64, peers: Vec<u64>) -> RaftCore {
@@ -166,50 +211,7 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn test_submit_not_leader() {
-        let core = Arc::new(Mutex::new(new_test_core(1, vec![2, 3])));
-        let app = create_client_router(core);
-
-        let request = Request::builder()
-            .method("POST")
-            .uri("/client/submit")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"command": "SET x=1"}"#))
-            .unwrap();
-
-        let response = app.oneshot(request).await.unwrap();
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error.error, "Not the leader");
-        assert_eq!(error.leader_hint, None);
-    }
-
-    #[tokio::test]
-    async fn test_submit_as_leader() {
-        let mut core = new_test_core(1, vec![2, 3]);
-        core.become_leader();
-        let core = Arc::new(Mutex::new(core));
-        let app = create_client_router(core);
-
-        let request = Request::builder()
-            .method("POST")
-            .uri("/client/submit")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"command": "SET x=1"}"#))
-            .unwrap();
-
-        let response = app.oneshot(request).await.unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let result: SubmitResponse = serde_json::from_slice(&body).unwrap();
-        assert!(result.result.contains("accepted"));
-    }
+    // === Core-only tests (leader/status endpoints) ===
 
     #[tokio::test]
     async fn test_leader_endpoint_follower() {
@@ -285,13 +287,22 @@ mod tests {
         assert_eq!(result.last_applied, 2);
     }
 
-    #[tokio::test]
-    async fn test_submit_with_leader_hint() {
-        // Simulate a follower that knows who the leader is
-        let mut core = new_test_core(1, vec![2, 3]);
-        core.current_leader = Some(2); // We know node 2 is the leader
-        let core = Arc::new(Mutex::new(core));
-        let app = create_client_router(core);
+    // === Full integration tests (submit endpoint with RaftServer) ===
+
+    #[tokio::test(start_paused = true)]
+    async fn test_submit_not_leader_full() {
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, _handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        let core1 = new_test_core(1, vec![2, 3]);
+        let transport1 = transports.remove(&1).unwrap();
+
+        let (server, shared1) = RaftServer::new(core1, transport1);
+        let handle = server.start();
+
+        // Node 1 is not leader, submit should fail
+        let app = create_client_router_full(handle.clone(), shared1);
 
         let request = Request::builder()
             .method("POST")
@@ -307,6 +318,86 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(error.error, "Not the leader");
-        assert_eq!(error.leader_hint, Some(2)); // Should hint at node 2
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_submit_as_leader_full() {
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        let core1 = new_test_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
+
+        let transport1 = transports.remove(&1).unwrap();
+        let transport2 = transports.remove(&2).unwrap();
+        let transport3 = transports.remove(&3).unwrap();
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Set up servers (but don't start them yet)
+        let (server1, shared1) = RaftServer::new(core1, transport1);
+        let (_server2, shared2) = RaftServer::new(core2, transport2);
+        let (_server3, shared3) = RaftServer::new(core3, transport3);
+
+        // Win election manually before starting server loop
+        server1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        // Now start the server loop
+        let raft_handle1 = server1.start();
+
+        // Create client router with full integration
+        let app = create_client_router_full(raft_handle1, shared1.clone());
+
+        // Submit a command via HTTP
+        let request = Request::builder()
+            .method("POST")
+            .uri("/client/submit")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"command": "SET x=42"}"#))
+            .unwrap();
+
+        // Process the submit while handling peer requests
+        let shared2_clone = shared2.clone();
+        let shared3_clone = shared3.clone();
+
+        // Spawn peer handlers (they'll process the replication requests)
+        tokio::spawn(async move {
+            tokio::join!(
+                handle2.process_one_shared(&shared2_clone),
+                handle3.process_one_shared(&shared3_clone),
+            );
+        });
+
+        // Spawn the HTTP request
+        let response_task = tokio::spawn(async move {
+            app.oneshot(request).await
+        });
+
+        // Advance time to let all tasks make progress
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+
+        let response = response_task.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: SubmitResponse = serde_json::from_slice(&body).unwrap();
+        // TestStateMachine returns empty string on success
+        assert_eq!(result.result, "");
+
+        // Verify entry was committed
+        assert_eq!(shared1.lock().await.commit_index, 1);
+        assert_eq!(shared1.lock().await.last_applied, 1);
     }
 }

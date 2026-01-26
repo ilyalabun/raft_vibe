@@ -32,12 +32,12 @@ pub struct InMemoryTransport {
 
 impl InMemoryTransport {
     /// Create a new in-memory transport with senders to all nodes (no timeout)
-    pub fn new(senders: HashMap<u64, mpsc::Sender<Request>>) -> Self {
+    pub(crate) fn new(senders: HashMap<u64, mpsc::Sender<Request>>) -> Self {
         Self { senders, timeout: None }
     }
 
     /// Create a new in-memory transport with a timeout
-    pub fn with_timeout(senders: HashMap<u64, mpsc::Sender<Request>>, timeout: Duration) -> Self {
+    pub(crate) fn with_timeout(senders: HashMap<u64, mpsc::Sender<Request>>, timeout: Duration) -> Self {
         Self { senders, timeout: Some(timeout) }
     }
 }
