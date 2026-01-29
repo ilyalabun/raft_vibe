@@ -292,7 +292,7 @@ mod tests {
         let mut handle2 = handles.remove(&2).unwrap();
         let mut handle3 = handles.remove(&3).unwrap();
 
-        // Win election first
+        // Win election first (become_leader appends NOOP)
         node1.start_election().await;
         let (_, _, _) = tokio::join!(
             node1.request_votes(),
@@ -301,7 +301,7 @@ mod tests {
         );
         assert_eq!(node1.state().await, RaftState::Leader);
 
-        // Submit a command
+        // Submit a command (index 2, after NOOP at index 1)
         let entry_index = {
             let mut core = node1.core.lock().await;
             let entry = core.append_log_entry("SET x=1".to_string()).unwrap();
@@ -315,10 +315,10 @@ mod tests {
             handle3.process_one_shared(&shared3),
         );
 
-        // Entry should be committed
+        // Entry should be committed (NOOP + SET x=1)
         assert_eq!(node1.commit_index().await, entry_index);
-        assert_eq!(shared2.lock().await.log.len(), 1);
-        assert_eq!(shared3.lock().await.log.len(), 1);
+        assert_eq!(shared2.lock().await.log.len(), 2); // NOOP + command
+        assert_eq!(shared3.lock().await.log.len(), 2);
     }
 
     #[tokio::test]
@@ -368,6 +368,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_heartbeat_catches_up_followers() {
+        use crate::raft_core::NOOP_COMMAND;
+
         let node_ids = vec![1, 2, 3];
         let (mut transports, mut handles) = create_cluster(&node_ids);
 
@@ -384,7 +386,7 @@ mod tests {
         let mut handle2 = handles.remove(&2).unwrap();
         let mut handle3 = handles.remove(&3).unwrap();
 
-        // Win election first
+        // Win election first (become_leader appends NOOP)
         node1.start_election().await;
         let (_, _, _) = tokio::join!(
             node1.request_votes(),
@@ -404,18 +406,19 @@ mod tests {
         assert_eq!(shared2.lock().await.log.len(), 0);
         assert_eq!(shared3.lock().await.log.len(), 0);
 
-        // Send heartbeat - should replicate missing entries
+        // Send heartbeat - should replicate missing entries (NOOP + 2 commands)
         let (_, _, _) = tokio::join!(
             node1.send_heartbeat(),
             handle2.process_one_shared(&shared2),
             handle3.process_one_shared(&shared3),
         );
 
-        // Followers should now have the entries
-        assert_eq!(shared2.lock().await.log.len(), 2);
-        assert_eq!(shared3.lock().await.log.len(), 2);
-        assert_eq!(shared2.lock().await.log[0].command, "SET x=1");
-        assert_eq!(shared2.lock().await.log[1].command, "SET y=2");
+        // Followers should now have the entries (NOOP + SET x=1 + SET y=2)
+        assert_eq!(shared2.lock().await.log.len(), 3);
+        assert_eq!(shared3.lock().await.log.len(), 3);
+        assert_eq!(shared2.lock().await.log[0].command, NOOP_COMMAND);
+        assert_eq!(shared2.lock().await.log[1].command, "SET x=1");
+        assert_eq!(shared2.lock().await.log[2].command, "SET y=2");
     }
 
     #[tokio::test]
@@ -436,7 +439,7 @@ mod tests {
         let mut handle2 = handles.remove(&2).unwrap();
         let mut handle3 = handles.remove(&3).unwrap();
 
-        // Win election
+        // Win election (become_leader appends NOOP)
         node1.start_election().await;
         let (_, _, _) = tokio::join!(
             node1.request_votes(),
@@ -444,7 +447,7 @@ mod tests {
             handle3.process_one_shared(&shared3),
         );
 
-        // Submit multiple commands
+        // Submit multiple commands (after NOOP at index 1)
         let entry3_index = {
             let mut core = node1.core.lock().await;
             core.append_log_entry("CMD 1".to_string()).unwrap();
@@ -459,10 +462,10 @@ mod tests {
             handle3.process_one_shared(&shared3),
         );
 
-        // All entries should be replicated and committed
+        // All entries should be replicated and committed (NOOP + 3 commands)
         assert_eq!(node1.commit_index().await, entry3_index);
-        assert_eq!(shared2.lock().await.log.len(), 3);
-        assert_eq!(shared3.lock().await.log.len(), 3);
+        assert_eq!(shared2.lock().await.log.len(), 4);
+        assert_eq!(shared3.lock().await.log.len(), 4);
     }
 
     #[tokio::test(start_paused = true)]
@@ -519,7 +522,7 @@ mod tests {
 
         let mut handle2 = handles.remove(&2).unwrap();
 
-        // Win election first
+        // Win election first (become_leader appends NOOP)
         node1.start_election().await;
         let (_, _) = tokio::join!(
             node1.request_votes(),
@@ -527,7 +530,7 @@ mod tests {
         );
         assert_eq!(node1.state().await, RaftState::Leader);
 
-        // Submit a command
+        // Submit a command (index 2, after NOOP)
         let entry_index = {
             let mut core = node1.core.lock().await;
             core.append_log_entry("SET x=1".to_string()).unwrap().index
@@ -541,7 +544,7 @@ mod tests {
 
         // Entry should be committed (leader + node2 = majority)
         assert_eq!(node1.commit_index().await, entry_index);
-        assert_eq!(shared2.lock().await.log.len(), 1);
+        assert_eq!(shared2.lock().await.log.len(), 2); // NOOP + command
     }
 
     #[tokio::test(start_paused = true)]

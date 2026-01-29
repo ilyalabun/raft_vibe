@@ -396,8 +396,8 @@ mod tests {
         // TestStateMachine returns empty string on success
         assert_eq!(result.result, "");
 
-        // Verify entry was committed
-        assert_eq!(shared1.lock().await.commit_index, 1);
-        assert_eq!(shared1.lock().await.last_applied, 1);
+        // Verify entry was committed (NOOP at index 1 + command at index 2)
+        assert_eq!(shared1.lock().await.commit_index, 2);
+        assert_eq!(shared1.lock().await.last_applied, 2);
     }
 }

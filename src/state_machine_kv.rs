@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::raft_core::NOOP_COMMAND;
 use crate::state_machine::{ApplyResult, StateMachine};
 
 /// Simple in-memory key-value store
@@ -46,6 +47,11 @@ impl StateMachine for SharedKvStore {
 
 impl StateMachine for KeyValueStore {
     fn apply(&mut self, command: &str) -> ApplyResult {
+        // Handle no-op command (used by leader on election)
+        if command == NOOP_COMMAND {
+            return Ok(String::new());
+        }
+
         let parts: Vec<&str> = command.splitn(3, ' ').collect();
 
         match parts.as_slice() {

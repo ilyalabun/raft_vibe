@@ -141,6 +141,12 @@ impl NodeHandle {
             }
         }
     }
+
+    /// Drain all pending requests without processing them.
+    /// Simulates requests being lost due to network timeout/partition.
+    pub fn drain_pending(&mut self) {
+        while self.receiver.try_recv().is_ok() {}
+    }
 }
 
 /// Create transports and handles for a cluster of nodes

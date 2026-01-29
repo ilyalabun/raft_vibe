@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use crate::state_machine::StateMachine;
 use crate::storage::Storage;
 
+/// Special no-op command appended by leaders on election.
+/// This allows committing entries from previous terms indirectly.
+pub const NOOP_COMMAND: &str = "NOOP";
+
 /// Raft node states
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RaftState {
@@ -411,12 +415,23 @@ impl RaftCore {
         self.current_leader = Some(self.id);
         println!("[NODE {}] Became LEADER for term {}", self.id, self.current_term);
 
-        // Reinitialize next_index and match_index
+        // Reinitialize next_index and match_index BEFORE appending no-op
+        // This way next_index points AT the no-op, so it gets sent in first heartbeat
         let last_index = self.last_log_index();
         for peer_id in &self.peers {
             self.next_index.insert(*peer_id, last_index + 1);
             self.match_index.insert(*peer_id, 0);
         }
+
+        // Append no-op entry to commit entries from previous terms
+        // (Raft paper Section 5.4.2: leader can only commit entries from current term)
+        let noop_entry = LogEntry {
+            term: self.current_term,
+            index: self.last_log_index() + 1,
+            command: NOOP_COMMAND.to_string(),
+        };
+        println!("[NODE {}] Appending no-op entry {}", self.id, noop_entry.index);
+        self.persist_log_entry(noop_entry);
     }
 
     /// Add a new log entry (called by leader when receiving client request)
@@ -1768,25 +1783,27 @@ mod tests {
         leader.current_term = 1;
         leader.state = RaftState::Leader;
         leader.become_leader();
+        // become_leader() appends NOOP at index 1
 
-        // Append first entry
+        // Append first entry (after NOOP)
         let entry1 = leader.append_log_entry("CMD 1".to_string());
         assert!(entry1.is_some());
-        assert_eq!(entry1.unwrap().index, 1);
+        assert_eq!(entry1.unwrap().index, 2);
 
         // Append second entry
         let entry2 = leader.append_log_entry("CMD 2".to_string());
         assert!(entry2.is_some());
-        assert_eq!(entry2.unwrap().index, 2);
+        assert_eq!(entry2.unwrap().index, 3);
 
         // Append third entry
         let entry3 = leader.append_log_entry("CMD 3".to_string());
         assert!(entry3.is_some());
-        assert_eq!(entry3.unwrap().index, 3);
+        assert_eq!(entry3.unwrap().index, 4);
 
-        assert_eq!(leader.log.len(), 3);
-        assert_eq!(leader.log[0].command, "CMD 1");
-        assert_eq!(leader.log[2].command, "CMD 3");
+        assert_eq!(leader.log.len(), 4); // NOOP + 3 commands
+        assert_eq!(leader.log[0].command, NOOP_COMMAND);
+        assert_eq!(leader.log[1].command, "CMD 1");
+        assert_eq!(leader.log[3].command, "CMD 3");
     }
 
     #[test]
@@ -2108,7 +2125,7 @@ mod tests {
         node.start_election();
 
         // Become leader and append entry
-        node.become_leader();
+        node.become_leader(); // Appends NOOP
         node.append_log_entry("SET x=1".to_string());
 
         // Now "restart" by creating new node with same storage
@@ -2116,8 +2133,9 @@ mod tests {
         // So let's just verify the in-memory state matches what should be persisted
         assert_eq!(node.current_term, 1);
         assert_eq!(node.voted_for, Some(1));
-        assert_eq!(node.log.len(), 1);
-        assert_eq!(node.log[0].command, "SET x=1");
+        assert_eq!(node.log.len(), 2); // NOOP + SET x=1
+        assert_eq!(node.log[0].command, NOOP_COMMAND);
+        assert_eq!(node.log[1].command, "SET x=1");
     }
 
     // === State Machine Apply Tests ===
@@ -2178,33 +2196,34 @@ mod tests {
             Box::new(TestStateMachine::new_shared(applied.clone())),
         );
 
-        node.become_leader();
-        node.append_log_entry("SET x=1".to_string());
-        node.append_log_entry("SET y=2".to_string());
-        node.append_log_entry("SET z=3".to_string());
+        node.become_leader(); // Appends NOOP at index 1
+        node.append_log_entry("SET x=1".to_string()); // index 2
+        node.append_log_entry("SET y=2".to_string()); // index 3
+        node.append_log_entry("SET z=3".to_string()); // index 4
 
         // Nothing applied yet
         assert!(applied.lock().unwrap().is_empty());
 
-        // Commit first two entries
+        // Commit first two entries (NOOP + SET x=1)
         node.commit_index = 2;
         node.apply_committed_entries();
 
         {
             let applied = applied.lock().unwrap();
             assert_eq!(applied.len(), 2);
-            assert_eq!(applied[0], "SET x=1");
-            assert_eq!(applied[1], "SET y=2");
+            assert_eq!(applied[0], NOOP_COMMAND);
+            assert_eq!(applied[1], "SET x=1");
         }
 
-        // Commit remaining entry
-        node.commit_index = 3;
+        // Commit up to SET z=3
+        node.commit_index = 4;
         node.apply_committed_entries();
 
         {
             let applied = applied.lock().unwrap();
-            assert_eq!(applied.len(), 3);
-            assert_eq!(applied[2], "SET z=3");
+            assert_eq!(applied.len(), 4);
+            assert_eq!(applied[2], "SET y=2");
+            assert_eq!(applied[3], "SET z=3");
         }
     }
 }

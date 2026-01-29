@@ -365,11 +365,49 @@ Created `SharedKvStore = Arc<Mutex<KeyValueStore>>` to share state machine betwe
 
 Identified a known Raft issue: on restart, the state machine is empty until a write happens because `commit_index` starts at 0 (it's volatile state) and leaders can only commit entries from the current term. The proper Raft solution is to append a no-op entry when a leader is elected, which commits all prior entries indirectly. This is a future enhancement.
 
+## Day 11: No-Op Entry on Leader Election
+
+**Prompt:** "ok, let's continue day 11 and implement no-op message"
+
+**Implementing No-Op Entry**
+
+Implemented the no-op entry feature to fix state machine recovery after leader election. Added a `NOOP_COMMAND` constant to `raft_core.rs`. Modified `become_leader()` to first initialize `next_index` and `match_index` for all peers (pointing to the last log index before the no-op), then append the no-op entry. This ordering (Option B) is faster because peers' `next_index` already points to the correct position for immediate replication.
+
+**Handling NOOP in State Machine**
+
+Updated `KeyValueStore` to recognize and handle the NOOP command - it simply returns an empty string without modifying state. This allows the no-op to flow through the state machine without errors.
+
+**Test Infrastructure Improvements**
+
+Added `drain_pending()` method to `NodeHandle` in the in-memory transport. This clears leftover requests in the channel, simulating requests being lost due to network timeout/partition. Essential for testing scenarios where some requests time out and new requests need to be processed cleanly.
+
+**Updating Existing Tests**
+
+Updated many tests across `raft_core.rs`, `raft_node.rs`, `raft_server.rs`, and `client_http.rs` to account for the no-op entry at index 1. Log lengths, commit indices, and applied command counts all shift by 1 because leaders now always have at least the NOOP entry.
+
+**Prompt:** "what scenarios we should also consider to test this functionality?"
+
+**Recovery Scenario Tests**
+
+Added comprehensive tests for no-op behavior:
+
+1. `test_uncommitted_entries_committed_via_noop` - 5-node cluster where leader 1 replicates entries to only 1 follower (2/5 = minority, not committed). Leader 1 crashes, follower 2 (which has the entries) becomes leader 2 and appends its own NOOP. When NOOP commits with majority, all prior entries are committed indirectly.
+
+2. `test_fresh_node_catches_up_from_empty` - Node 3 starts with empty log while leader has committed entries. Via heartbeats, node 3 catches up on all entries including NOOP.
+
+**Key Technical Discoveries**
+
+- Multiple heartbeats are needed for log catch-up because `next_index` starts at the leader's log end and decrements on each rejection until it reaches index 1 where entries can be sent.
+- 5-node cluster needed for minority replication tests (2/5 < majority of 3).
+- `#[tokio::test(start_paused = true)]` auto-advances time for tokio timeouts, making timeout tests deterministic.
+
+Test suite now has 134 tests, all passing.
+
 ---
 
 ## Next Up
 
-- **Day 11:** Implement no-op entry on leader election to fix state machine recovery
+- Potential future work: Log compaction/snapshotting, dynamic cluster membership
 
 ---
 

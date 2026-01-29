@@ -301,7 +301,7 @@ mod tests {
         let mut handle2 = handles.remove(&2).unwrap();
         let mut handle3 = handles.remove(&3).unwrap();
 
-        // Win election first
+        // Win election first (become_leader appends NOOP)
         server1.start_election().await;
         let (_, _, _) = tokio::join!(
             server1.request_votes(),
@@ -310,7 +310,7 @@ mod tests {
         );
         assert_eq!(server1.state().await, RaftState::Leader);
 
-        // Submit a command
+        // Submit a command (NOOP is at index 1, command at index 2)
         let entry_index = {
             let mut core = shared1.lock().await;
             let entry = core.append_log_entry("SET x=1".to_string()).unwrap();
@@ -324,10 +324,10 @@ mod tests {
             handle3.process_one_shared(&shared3),
         );
 
-        // Entry should be committed
+        // Entry should be committed (NOOP + command)
         assert_eq!(server1.commit_index().await, entry_index);
-        assert_eq!(shared2.lock().await.log.len(), 1);
-        assert_eq!(shared3.lock().await.log.len(), 1);
+        assert_eq!(shared2.lock().await.log.len(), 2);
+        assert_eq!(shared3.lock().await.log.len(), 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -487,15 +487,15 @@ mod tests {
         // Command should succeed (TestStateMachine returns empty string)
         assert!(result.is_ok());
 
-        // Verify state on leader
-        assert_eq!(shared1.lock().await.log.len(), 1);
-        assert_eq!(shared1.lock().await.log[0].command, "SET x=42");
-        assert_eq!(shared1.lock().await.commit_index, 1);
-        assert_eq!(shared1.lock().await.last_applied, 1);
+        // Verify state on leader (NOOP at index 1 + command at index 2)
+        assert_eq!(shared1.lock().await.log.len(), 2);
+        assert_eq!(shared1.lock().await.log[1].command, "SET x=42");
+        assert_eq!(shared1.lock().await.commit_index, 2);
+        assert_eq!(shared1.lock().await.last_applied, 2);
 
         // Verify state on followers
-        assert_eq!(shared2.lock().await.log.len(), 1);
-        assert_eq!(shared3.lock().await.log.len(), 1);
+        assert_eq!(shared2.lock().await.log.len(), 2);
+        assert_eq!(shared3.lock().await.log.len(), 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -566,10 +566,10 @@ mod tests {
         assert!(result2.is_ok());
         assert!(result3.is_ok());
 
-        // All entries should be committed
-        assert_eq!(shared1.lock().await.commit_index, 3);
-        assert_eq!(shared2.lock().await.log.len(), 3);
-        assert_eq!(shared3.lock().await.log.len(), 3);
+        // All entries should be committed (NOOP + 3 commands)
+        assert_eq!(shared1.lock().await.commit_index, 4);
+        assert_eq!(shared2.lock().await.log.len(), 4);
+        assert_eq!(shared3.lock().await.log.len(), 4);
     }
 
     // === Leader Failover Tests ===
@@ -607,17 +607,17 @@ mod tests {
         assert_eq!(server1.state().await, RaftState::Leader);
         let term1 = shared1.lock().await.current_term;
 
-        // Leader 1 commits an entry
+        // Leader 1 commits an entry (NOOP is at index 1, command at index 2)
         {
             let mut core = shared1.lock().await;
             core.append_log_entry("CMD from leader 1".to_string());
         }
         let (_, _, _) = tokio::join!(
-            server1.node.replicate_to_peers(1),
+            server1.node.replicate_to_peers(2), // Command is at index 2
             handle2.process_one_shared(&shared2),
             handle3.process_one_shared(&shared3),
         );
-        assert_eq!(shared1.lock().await.commit_index, 1);
+        assert_eq!(shared1.lock().await.commit_index, 2);
 
         // Now node 1 "fails" - node 2 starts election with higher term
         server2.start_election().await;
@@ -633,9 +633,10 @@ mod tests {
         let term2 = shared2.lock().await.current_term;
         assert!(term2 > term1, "New leader should have higher term");
 
-        // Verify node 2 still has the committed entry from leader 1
-        assert_eq!(shared2.lock().await.log.len(), 1);
-        assert_eq!(shared2.lock().await.log[0].command, "CMD from leader 1");
+        // Verify node 2 still has the committed entries from leader 1 + its own NOOP
+        // Log: [NOOP from leader1, CMD from leader1, NOOP from leader2]
+        assert_eq!(shared2.lock().await.log.len(), 3);
+        assert_eq!(shared2.lock().await.log[1].command, "CMD from leader 1");
     }
 
     // === Network Partition Tests ===
@@ -673,16 +674,18 @@ mod tests {
 
         // Now partition leader from both followers
         // Leader tries to append an entry but neither follower responds
+        // (NOOP is at index 1, command at index 2)
         {
             let mut core = shared1.lock().await;
             core.append_log_entry("CMD during partition".to_string());
         }
 
         // Replicate without processing - both will timeout
-        server1.node.replicate_to_peers(1).await;
+        server1.node.replicate_to_peers(2).await;
 
         // Entry should NOT be committed (no majority)
-        assert_eq!(shared1.lock().await.log.len(), 1);
+        // Leader has NOOP + command = 2 entries, but commit_index still 0
+        assert_eq!(shared1.lock().await.log.len(), 2);
         assert_eq!(shared1.lock().await.commit_index, 0, "Should not commit without majority");
     }
 
@@ -768,6 +771,7 @@ mod tests {
         assert_eq!(server1.state().await, RaftState::Leader);
 
         // Commit entries while node 3 is "partitioned" (only node 2 responds)
+        // NOOP is at index 1, CMD 1 at index 2, CMD 2 at index 3
         {
             let mut core = shared1.lock().await;
             core.append_log_entry("CMD 1".to_string());
@@ -776,13 +780,13 @@ mod tests {
 
         // Replicate only to node 2 (node 3 is partitioned - times out)
         let (_, _) = tokio::join!(
-            server1.node.replicate_to_peers(2),
+            server1.node.replicate_to_peers(3), // CMD 2 is at index 3
             handle2.process_one_shared(&shared2),
         );
 
-        // Entries committed on leader and node 2
-        assert_eq!(shared1.lock().await.commit_index, 2);
-        assert_eq!(shared2.lock().await.log.len(), 2);
+        // Entries committed on leader and node 2 (NOOP + 2 commands)
+        assert_eq!(shared1.lock().await.commit_index, 3);
+        assert_eq!(shared2.lock().await.log.len(), 3);
         assert_eq!(shared3.lock().await.log.len(), 0); // Node 3 missed everything
 
         // Node 3 rejoins - leader sends heartbeat with catch-up entries
@@ -791,10 +795,10 @@ mod tests {
             handle3.process_one_shared(&shared3),
         );
 
-        // Node 3 should now have all entries
-        assert_eq!(shared3.lock().await.log.len(), 2);
-        assert_eq!(shared3.lock().await.log[0].command, "CMD 1");
-        assert_eq!(shared3.lock().await.log[1].command, "CMD 2");
+        // Node 3 should now have all entries (NOOP + 2 commands)
+        assert_eq!(shared3.lock().await.log.len(), 3);
+        assert_eq!(shared3.lock().await.log[1].command, "CMD 1");
+        assert_eq!(shared3.lock().await.log[2].command, "CMD 2");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1019,14 +1023,14 @@ mod tests {
         let result = submit_task.await.unwrap();
         assert!(result.is_ok());
 
-        // Entry should be committed AND applied on leader
-        assert_eq!(shared1.lock().await.commit_index, 1);
-        assert_eq!(shared1.lock().await.last_applied, 1);
+        // Entry should be committed AND applied on leader (NOOP + command)
+        assert_eq!(shared1.lock().await.commit_index, 2);
+        assert_eq!(shared1.lock().await.last_applied, 2);
 
-        // Verify the command was actually applied to state machine
+        // Verify the commands were actually applied to state machine (NOOP + SET)
         let applied = applied1.lock().unwrap();
-        assert_eq!(applied.len(), 1, "One command should be applied");
-        assert_eq!(applied[0], "SET x=42", "Correct command should be applied");
+        assert_eq!(applied.len(), 2, "NOOP and command should be applied");
+        assert_eq!(applied[1], "SET x=42", "Correct command should be applied");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1068,11 +1072,11 @@ mod tests {
         }
 
         // Replicate but don't process peer requests (simulating partition)
-        // Both peers will timeout
-        server1.node.replicate_to_peers(1).await;
+        // Both peers will timeout (command is at index 2 after NOOP)
+        server1.node.replicate_to_peers(2).await;
 
-        // Entry should be in log but NOT committed, NOT applied
-        assert_eq!(shared1.lock().await.log.len(), 1);
+        // Entry should be in log but NOT committed, NOT applied (NOOP + command)
+        assert_eq!(shared1.lock().await.log.len(), 2);
         assert_eq!(shared1.lock().await.commit_index, 0, "Should not commit without quorum");
         assert_eq!(shared1.lock().await.last_applied, 0, "Should not apply without commit");
 
@@ -1152,20 +1156,20 @@ mod tests {
 
         submit_task.await.unwrap().unwrap();
 
-        // Leader should have committed and applied
-        assert_eq!(shared1.lock().await.commit_index, 1);
-        assert_eq!(shared1.lock().await.last_applied, 1);
+        // Leader should have committed and applied (NOOP + command)
+        assert_eq!(shared1.lock().await.commit_index, 2);
+        assert_eq!(shared1.lock().await.last_applied, 2);
 
-        // Verify leader's state machine received the command
+        // Verify leader's state machine received the commands (NOOP + SET)
         {
             let leader_applied = applied1.lock().unwrap();
-            assert_eq!(leader_applied.len(), 1);
-            assert_eq!(leader_applied[0], "SET x=42");
+            assert_eq!(leader_applied.len(), 2);
+            assert_eq!(leader_applied[1], "SET x=42");
         }
 
-        // Followers have entry but may not have applied yet
-        assert_eq!(shared2.lock().await.log.len(), 1);
-        assert_eq!(shared3.lock().await.log.len(), 1);
+        // Followers have entries but may not have applied yet (NOOP + command)
+        assert_eq!(shared2.lock().await.log.len(), 2);
+        assert_eq!(shared3.lock().await.log.len(), 2);
 
         // Advance time past heartbeat interval to trigger heartbeat with updated commit_index
         for _ in 0..10 {
@@ -1174,21 +1178,365 @@ mod tests {
         }
 
         // Now followers should have applied
-        assert_eq!(shared2.lock().await.commit_index, 1);
-        assert_eq!(shared2.lock().await.last_applied, 1);
-        assert_eq!(shared3.lock().await.commit_index, 1);
-        assert_eq!(shared3.lock().await.last_applied, 1);
+        assert_eq!(shared2.lock().await.commit_index, 2);
+        assert_eq!(shared2.lock().await.last_applied, 2);
+        assert_eq!(shared3.lock().await.commit_index, 2);
+        assert_eq!(shared3.lock().await.last_applied, 2);
 
-        // Verify followers' state machines received the command
+        // Verify followers' state machines received the commands (NOOP + SET)
         {
             let follower2_applied = applied2.lock().unwrap();
-            assert_eq!(follower2_applied.len(), 1, "Follower 2 should have applied");
-            assert_eq!(follower2_applied[0], "SET x=42");
+            assert_eq!(follower2_applied.len(), 2, "Follower 2 should have applied NOOP + command");
+            assert_eq!(follower2_applied[1], "SET x=42");
         }
         {
             let follower3_applied = applied3.lock().unwrap();
-            assert_eq!(follower3_applied.len(), 1, "Follower 3 should have applied");
-            assert_eq!(follower3_applied[0], "SET x=42");
+            assert_eq!(follower3_applied.len(), 2, "Follower 3 should have applied NOOP + command");
+            assert_eq!(follower3_applied[1], "SET x=42");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_state_machine_recovery_after_reelection() {
+        use crate::raft_core::NOOP_COMMAND;
+        use crate::transport_inmemory::create_cluster_with_timeout;
+
+        // Scenario: Leader 1 commits entries, then fails.
+        // Leader 2 wins election and appends NOOP.
+        // When NOOP is committed, prior entries should be applied on new leader.
+
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        // Create shared state machines to verify applies
+        let applied1: AppliedCommands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let applied2: AppliedCommands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let applied3: AppliedCommands = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let core1 = new_test_core_with_shared(1, vec![2, 3], applied1.clone());
+        let core2 = new_test_core_with_shared(2, vec![1, 3], applied2.clone());
+        let core3 = new_test_core_with_shared(3, vec![1, 2], applied3.clone());
+
+        let transport1 = transports.remove(&1).unwrap();
+        let transport2 = transports.remove(&2).unwrap();
+
+        let (server1, shared1) = RaftServer::new(core1, transport1);
+        let (server2, shared2) = RaftServer::new(core2, transport2);
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // === Phase 1: Leader 1 wins election and commits entries ===
+        server1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        // Leader 1 appends and commits entries
+        {
+            let mut core = shared1.lock().await;
+            core.append_log_entry("SET x=1".to_string());
+            core.append_log_entry("SET y=2".to_string());
+        }
+
+        // Replicate to majority (entries at indices 2 and 3, after NOOP at 1)
+        let (_, _, _) = tokio::join!(
+            server1.node.replicate_to_peers(3),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+
+        // Verify leader 1 committed and applied
+        assert_eq!(shared1.lock().await.commit_index, 3);
+        {
+            let applied = applied1.lock().unwrap();
+            assert_eq!(applied.len(), 3); // NOOP + 2 commands
+            assert_eq!(applied[1], "SET x=1");
+            assert_eq!(applied[2], "SET y=2");
+        }
+
+        // Followers have entries replicated but not yet committed
+        assert_eq!(shared2.lock().await.log.len(), 3);
+        assert_eq!(shared3.lock().await.log.len(), 3);
+
+        // === Phase 2: Leader 1 "fails", Leader 2 wins election ===
+        // Leader 2 starts election with higher term
+        server2.start_election().await;
+
+        // Only node 3 responds (node 1 "failed")
+        let (_, _) = tokio::join!(
+            server2.request_votes(),
+            handle3.process_one_shared(&shared3),
+        );
+
+        // Leader 2 should win (self + node 3 = majority)
+        assert_eq!(server2.state().await, RaftState::Leader);
+        assert!(shared2.lock().await.current_term > 1);
+
+        // Leader 2 has appended its own NOOP at index 4
+        assert_eq!(shared2.lock().await.log.len(), 4);
+        assert_eq!(shared2.lock().await.log[3].command, NOOP_COMMAND);
+
+        // === Phase 3: Leader 2 replicates NOOP, commits all prior entries ===
+        // Replicate to node 3 (node 1 still "failed")
+        let (_, _) = tokio::join!(
+            server2.node.replicate_to_peers(4),
+            handle3.process_one_shared(&shared3),
+        );
+
+        // Leader 2 should now have committed all entries including its NOOP
+        assert_eq!(shared2.lock().await.commit_index, 4);
+
+        // Verify Leader 2's state machine now has all applied entries
+        {
+            let applied = applied2.lock().unwrap();
+            assert_eq!(applied.len(), 4); // NOOP1 + SET x=1 + SET y=2 + NOOP2
+            assert_eq!(applied[0], NOOP_COMMAND);
+            assert_eq!(applied[1], "SET x=1");
+            assert_eq!(applied[2], "SET y=2");
+            assert_eq!(applied[3], NOOP_COMMAND);
+        }
+
+        // Node 3 should also have all entries applied after receiving commit notification
+        assert_eq!(shared3.lock().await.log.len(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_uncommitted_entries_committed_via_noop() {
+        use crate::raft_core::NOOP_COMMAND;
+        use crate::transport_inmemory::create_cluster_with_timeout;
+
+        // Scenario: 5-node cluster. Leader 1 replicates entries to only ONE follower.
+        // 2/5 is minority, so entries are NOT committed. Leader 1 crashes.
+        // Leader 2 (which has those entries) wins election.
+        // Leader 2's NOOP commits all prior entries.
+
+        let node_ids = vec![1, 2, 3, 4, 5];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        let applied2: AppliedCommands = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let core1 = new_test_core(1, vec![2, 3, 4, 5]);
+        let core2 = new_test_core_with_shared(2, vec![1, 3, 4, 5], applied2.clone());
+        let core3 = new_test_core(3, vec![1, 2, 4, 5]);
+        let core4 = new_test_core(4, vec![1, 2, 3, 5]);
+        let core5 = new_test_core(5, vec![1, 2, 3, 4]);
+
+        let transport1 = transports.remove(&1).unwrap();
+        let transport2 = transports.remove(&2).unwrap();
+
+        let (server1, shared1) = RaftServer::new(core1, transport1);
+        let (server2, shared2) = RaftServer::new(core2, transport2);
+        let shared3 = Arc::new(Mutex::new(core3));
+        let shared4 = Arc::new(Mutex::new(core4));
+        let shared5 = Arc::new(Mutex::new(core5));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+        let mut handle4 = handles.remove(&4).unwrap();
+        let mut handle5 = handles.remove(&5).unwrap();
+
+        // === Phase 1: Leader 1 wins election ===
+        server1.start_election().await;
+        let (_, _, _, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+            handle4.process_one_shared(&shared4),
+            handle5.process_one_shared(&shared5),
+        );
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        // Leader 1 appends entries
+        {
+            let mut core = shared1.lock().await;
+            core.append_log_entry("SET x=1".to_string());
+            core.append_log_entry("SET y=2".to_string());
+        }
+
+        // Replicate to node 2 ONLY (others time out)
+        // 2/5 is minority, so entries are NOT committed
+        let (_, _) = tokio::join!(
+            server1.node.replicate_to_peers(3),
+            handle2.process_one_shared(&shared2),
+            // others not processed - timeout
+        );
+
+        // Verify: Leader 1 did NOT commit (only 1 peer responded, need 3 for majority of 5)
+        assert_eq!(shared1.lock().await.commit_index, 0);
+        // But node 2 has the entries replicated
+        assert_eq!(shared2.lock().await.log.len(), 3); // NOOP + 2 entries
+        // Other nodes have nothing
+        assert_eq!(shared3.lock().await.log.len(), 0);
+        assert_eq!(shared4.lock().await.log.len(), 0);
+        assert_eq!(shared5.lock().await.log.len(), 0);
+
+        // Node 2's state machine has NOT applied anything (not committed)
+        assert!(applied2.lock().unwrap().is_empty());
+
+        // === Phase 2: Leader 1 "crashes", Leader 2 wins election ===
+        // Drain leftover AppendEntries that timed out (simulates lost requests)
+        handle3.drain_pending();
+        handle4.drain_pending();
+        handle5.drain_pending();
+
+        // Node 2 has the most up-to-date log, so it can become leader
+        server2.start_election().await;
+
+        // Nodes 3, 4, 5 vote for node 2 (node 1 "crashed")
+        let (_, _, _, _) = tokio::join!(
+            server2.request_votes(),
+            handle3.process_one_shared(&shared3),
+            handle4.process_one_shared(&shared4),
+            handle5.process_one_shared(&shared5),
+        );
+
+        assert_eq!(server2.state().await, RaftState::Leader);
+
+        // Leader 2 now has: [NOOP1, SET x=1, SET y=2, NOOP2]
+        assert_eq!(shared2.lock().await.log.len(), 4);
+
+        // === Phase 3: Leader 2 replicates NOOP, commits ALL entries ===
+        // Drain any leftover requests from previous phases
+        handle3.drain_pending();
+        handle4.drain_pending();
+        handle5.drain_pending();
+
+        // Multiple heartbeats needed for catch-up:
+        // - next_index starts at 4 (set before NOOP was appended)
+        // - Followers have empty logs, so they reject until next_index = 1
+        // - Each rejection decrements next_index
+        for _ in 0..5 {
+            let (_, _, _) = tokio::join!(
+                server2.node.send_heartbeat(),
+                handle3.process_one_shared(&shared3),
+                handle4.process_one_shared(&shared4),
+            );
+            if shared2.lock().await.commit_index >= 4 {
+                break;
+            }
+        }
+        assert_eq!(shared2.lock().await.commit_index, 4);
+
+        // Verify state machine on Leader 2 now has all entries applied
+        {
+            let applied = applied2.lock().unwrap();
+            assert_eq!(applied.len(), 4);
+            assert_eq!(applied[0], NOOP_COMMAND);
+            assert_eq!(applied[1], "SET x=1");
+            assert_eq!(applied[2], "SET y=2");
+            assert_eq!(applied[3], NOOP_COMMAND);
+        }
+
+        // Nodes 3 and 4 should have caught up with all entries
+        {
+            let core3 = shared3.lock().await;
+            assert_eq!(core3.log.len(), 4);
+            assert_eq!(core3.log[0].command, NOOP_COMMAND);
+            assert_eq!(core3.log[1].command, "SET x=1");
+            assert_eq!(core3.log[2].command, "SET y=2");
+            assert_eq!(core3.log[3].command, NOOP_COMMAND);
+        }
+        {
+            let core4 = shared4.lock().await;
+            assert_eq!(core4.log.len(), 4);
+            assert_eq!(core4.log[0].command, NOOP_COMMAND);
+            assert_eq!(core4.log[1].command, "SET x=1");
+            assert_eq!(core4.log[2].command, "SET y=2");
+            assert_eq!(core4.log[3].command, NOOP_COMMAND);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_fresh_node_catches_up_from_empty() {
+        use crate::raft_core::NOOP_COMMAND;
+        use crate::transport_inmemory::create_cluster_with_timeout;
+
+        // Scenario: Node 3 starts with empty log while leader has committed entries.
+        // When node 3 receives heartbeats, it catches up on all entries.
+
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        let applied3: AppliedCommands = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let core1 = new_test_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core_with_shared(3, vec![1, 2], applied3.clone());
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let (server1, shared1) = RaftServer::new(core1, transport1);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // === Phase 1: Leader commits entries with only node 2 ===
+        server1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        // Add entries and replicate only to node 2 (node 3 "partitioned")
+        {
+            let mut core = shared1.lock().await;
+            core.append_log_entry("SET a=1".to_string());
+            core.append_log_entry("SET b=2".to_string());
+        }
+
+        // Replicate to node 2 only (node 3 times out)
+        let (_, _) = tokio::join!(
+            server1.node.replicate_to_peers(3),
+            handle2.process_one_shared(&shared2),
+        );
+
+        // Verify leader committed (leader + node2 = majority)
+        assert_eq!(shared1.lock().await.commit_index, 3);
+        assert_eq!(shared2.lock().await.log.len(), 3);
+        assert_eq!(shared3.lock().await.log.len(), 0); // Node 3 has nothing
+
+        // === Phase 2: Node 3 "rejoins" and catches up via heartbeat ===
+        handle3.drain_pending();
+
+        // Send heartbeats until node 3 catches up (multiple rounds for next_index decrement)
+        for _ in 0..5 {
+            let (_, _) = tokio::join!(
+                server1.node.send_heartbeat(),
+                handle3.process_one_shared(&shared3),
+            );
+            if shared3.lock().await.log.len() >= 3 {
+                break;
+            }
+        }
+
+        // Node 3 should have all entries
+        {
+            let core3 = shared3.lock().await;
+            assert_eq!(core3.log.len(), 3);
+            assert_eq!(core3.log[0].command, NOOP_COMMAND);
+            assert_eq!(core3.log[1].command, "SET a=1");
+            assert_eq!(core3.log[2].command, "SET b=2");
+        }
+
+        // Node 3 should have applied entries (commit notification in heartbeat)
+        {
+            let applied = applied3.lock().unwrap();
+            assert_eq!(applied.len(), 3);
+            assert_eq!(applied[0], NOOP_COMMAND);
+            assert_eq!(applied[1], "SET a=1");
+            assert_eq!(applied[2], "SET b=2");
         }
     }
 }
