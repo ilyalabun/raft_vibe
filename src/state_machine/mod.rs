@@ -3,6 +3,8 @@
 //! The state machine is the application logic that Raft coordinates.
 //! When log entries are committed, they are applied to the state machine.
 
+pub mod kv;
+
 use std::sync::{Arc, Mutex};
 
 /// Result of applying a command to the state machine

@@ -4,10 +4,13 @@
 //! responding to RPCs: current_term, voted_for, and log entries.
 //!
 //! This module provides a trait abstraction allowing different implementations:
-//! - `MemoryStorage`: Fast, in-memory storage for testing (see storage_memory.rs)
-//! - Future: `FileStorage` for real persistence
+//! - `MemoryStorage`: Fast, in-memory storage for testing
+//! - `FileStorage`: File-based storage with CRC32 checksums
 
-use crate::raft_core::LogEntry;
+pub mod file;
+pub mod memory;
+
+use crate::core::raft_core::LogEntry;
 use std::fmt;
 
 /// Errors that can occur during storage operations

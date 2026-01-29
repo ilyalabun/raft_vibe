@@ -1,24 +1,16 @@
 //! Raft Consensus Algorithm - Learning Implementation
-//! 
+//!
 //! This is an educational implementation of the Raft consensus protocol.
 //! Start by reading README.md and rust_basics.md!
 
-mod client_http;
-mod config;
-mod raft_node;
-mod raft_core;
-mod raft_server;
+mod api;
+mod core;
 mod state_machine;
-mod state_machine_kv;
 mod storage;
-mod storage_file;
-mod storage_memory;
 mod transport;
-mod transport_http;
-mod transport_inmemory;
 
-use raft_core::{RaftCore, RequestVoteArgs, AppendEntriesArgs};
-use storage_memory::MemoryStorage;
+use core::raft_core::{RaftCore, RequestVoteArgs, AppendEntriesArgs};
+use storage::memory::MemoryStorage;
 
 fn main() {
     println!("=== Raft Consensus Algorithm Demo ===\n");
@@ -85,7 +77,7 @@ fn main() {
     let entry = node1.append_log_entry("SET x=42".to_string());
     let entry = match entry {
         Some(e) => {
-            println!("  Added log entry: term={}, index={}, command={}", 
+            println!("  Added log entry: term={}, index={}, command={}",
                     e.term, e.index, e.command);
             e
         }
@@ -100,15 +92,15 @@ fn main() {
     println!("Follower (Node 2) receives client command: SET x=43");
     let follower_entry = node2.append_log_entry("SET x=43".to_string());
     match follower_entry {
-        Some(e) => println!("  Added log entry: term={}, index={}, command={}", 
+        Some(e) => println!("  Added log entry: term={}, index={}, command={}",
                            e.term, e.index, e.command),
         None => println!("  REJECTED: Followers cannot accept client commands!"),
     }
-    println!();    
+    println!();
 
     // Leader replicates log to followers
     println!("Leader replicates log to followers...");
-    
+
     // Replicate to Node 2
     let append_args_2 = AppendEntriesArgs {
         term: node1.current_term,
@@ -143,7 +135,7 @@ fn main() {
     if committed_2.is_some() || committed_3.is_some() {
         let committed_index = committed_2.or(committed_3).unwrap();
         println!("\nEntry committed (index: {})", committed_index);
-        
+
         // Send updated commit_index to followers via AppendEntries (heartbeat)
         let heartbeat_2 = AppendEntriesArgs {
             term: node1.current_term,
@@ -174,13 +166,13 @@ fn main() {
     println!("  Log entries: {}", node1.log.len());
     println!("  Commit index: {}", node1.commit_index);
     println!("  Last applied: {}", node1.last_applied);
-    
+
     println!("\nNode 2 (Follower):");
     println!("  State: {:?}", node2.state);
     println!("  Term: {}", node2.current_term);
     println!("  Log entries: {}", node2.log.len());
     println!("  Last applied: {}", node2.last_applied);
-    
+
     println!("\nNode 3 (Follower):");
     println!("  State: {:?}", node3.state);
     println!("  Term: {}", node3.current_term);

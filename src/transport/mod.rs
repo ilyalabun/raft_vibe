@@ -1,8 +1,13 @@
 //! Transport abstraction for Raft RPC communication
 
+pub mod http;
+pub mod inmemory;
+
 use async_trait::async_trait;
 
-use crate::raft_core::{AppendEntriesArgs, AppendEntriesResult, RequestVoteArgs, RequestVoteResult};
+use crate::core::raft_core::{
+    AppendEntriesArgs, AppendEntriesResult, RequestVoteArgs, RequestVoteResult,
+};
 
 /// Transport abstraction for Raft RPC communication
 #[async_trait]

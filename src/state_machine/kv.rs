@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::raft_core::NOOP_COMMAND;
-use crate::state_machine::{ApplyResult, StateMachine};
+use crate::core::raft_core::NOOP_COMMAND;
+use super::{ApplyResult, StateMachine};
 
 /// Simple in-memory key-value store
 #[derive(Debug, Default)]

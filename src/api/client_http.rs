@@ -15,8 +15,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::raft_core::{RaftCore, RaftState};
-use crate::raft_server::{RaftError, RaftHandle};
+use crate::core::raft_core::{RaftCore, RaftState};
+use crate::core::raft_server::{RaftError, RaftHandle};
 
 /// Shared state for the client HTTP server
 pub type SharedCore = Arc<Mutex<RaftCore>>;
@@ -193,9 +193,9 @@ async fn handle_status_core(State(core): State<SharedCore>) -> Json<StatusRespon
 mod tests {
     use super::*;
     use crate::state_machine::TestStateMachine;
-    use crate::storage_memory::MemoryStorage;
-    use crate::raft_server::RaftServer;
-    use crate::transport_inmemory::create_cluster_with_timeout;
+    use crate::storage::memory::MemoryStorage;
+    use crate::core::raft_server::RaftServer;
+    use crate::transport::inmemory::create_cluster_with_timeout;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;

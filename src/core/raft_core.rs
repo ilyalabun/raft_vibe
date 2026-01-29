@@ -599,7 +599,7 @@ impl RaftCore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_memory::MemoryStorage;
+    use crate::storage::memory::MemoryStorage;
 
     /// Helper to create RaftCore with MemoryStorage for tests
     fn new_test_core(id: u64, peers: Vec<u64>) -> RaftCore {

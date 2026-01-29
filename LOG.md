@@ -403,6 +403,30 @@ Added comprehensive tests for no-op behavior:
 
 Test suite now has 134 tests, all passing.
 
+**Prompt:** "I see that project structure is pretty flat. can you suggest more hierarchical structure to better organize source code?"
+
+**Restructuring to Hierarchical Modules**
+
+Reorganized the flat `src/*.rs` structure into a hierarchical module layout:
+
+```
+src/
+├── lib.rs                    # Library root
+├── main.rs                   # Demo entry point
+├── core/                     # Core Raft consensus logic
+│   ├── mod.rs, config.rs, raft_core.rs, raft_node.rs, raft_server.rs
+├── storage/                  # Persistence layer
+│   ├── mod.rs (trait), memory.rs, file.rs
+├── transport/                # Network layer
+│   ├── mod.rs (trait), inmemory.rs, http.rs
+├── state_machine/            # Replicated state machines
+│   ├── mod.rs (trait), kv.rs
+└── api/                      # External APIs
+    ├── mod.rs, client_http.rs
+```
+
+Moved all files to appropriate subdirectories and updated imports throughout. Traits are defined in `mod.rs` of each module, with implementations in sibling files. This separation makes it easier to add new implementations (e.g., `transport/grpc.rs`, `storage/sqlite.rs`) and keeps related code together.
+
 ---
 
 ## Next Up

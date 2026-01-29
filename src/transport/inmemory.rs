@@ -5,10 +5,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::raft_core::{
+use crate::core::raft_core::{
     AppendEntriesArgs, AppendEntriesResult, RaftCore, RequestVoteArgs, RequestVoteResult,
 };
-use crate::transport::{Transport, TransportError};
+use super::{Transport, TransportError};
 
 /// Request types that can be sent to a node
 pub(crate) enum Request {
@@ -190,8 +190,8 @@ pub fn create_cluster_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft_core::RaftCore;
-    use crate::storage_memory::MemoryStorage;
+    use crate::core::raft_core::RaftCore;
+    use crate::storage::memory::MemoryStorage;
 
     /// Helper to create RaftCore with MemoryStorage for tests
     fn new_test_core(id: u64, peers: Vec<u64>) -> RaftCore {
@@ -320,7 +320,7 @@ mod tests {
 
         // Node 1 should become leader after receiving majority
         assert!(became_leader2 || became_leader3);
-        assert_eq!(node1.state, crate::raft_core::RaftState::Leader);
+        assert_eq!(node1.state, crate::core::raft_core::RaftState::Leader);
     }
 
     #[tokio::test(start_paused = true)]

@@ -7,8 +7,8 @@
 //!
 //! Uses checksums to detect corruption from partial writes.
 
-use crate::raft_core::LogEntry;
-use crate::storage::{Storage, StorageError};
+use crate::core::raft_core::LogEntry;
+use super::{Storage, StorageError};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};

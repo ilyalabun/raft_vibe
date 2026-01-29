@@ -4,9 +4,9 @@ use std::pin::pin;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, sleep_until, Duration, Instant};
 
-use crate::config::RaftConfig;
-use crate::raft_node::{RaftNode, SharedCore};
-use crate::raft_core::{RaftCore, RaftState};
+use super::config::RaftConfig;
+use super::raft_node::{RaftNode, SharedCore};
+use super::raft_core::{RaftCore, RaftState};
 use crate::transport::{Transport, TransportError};
 
 /// Errors that can occur during Raft operations
@@ -210,10 +210,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Mutex;
-    use crate::config::RaftConfig;
+    use crate::core::config::RaftConfig;
     use crate::state_machine::{AppliedCommands, TestStateMachine};
-    use crate::storage_memory::MemoryStorage;
-    use crate::transport_inmemory::create_cluster;
+    use crate::storage::memory::MemoryStorage;
+    use crate::transport::inmemory::create_cluster;
 
     /// Helper to create RaftCore with MemoryStorage for tests
     fn new_test_core(id: u64, peers: Vec<u64>) -> RaftCore {
@@ -424,7 +424,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_client_command_flow() {
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         // Test: submit → replicate → commit → applied
         let node_ids = vec![1, 2, 3];
@@ -500,7 +500,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_multiple_commands_in_sequence() {
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         let node_ids = vec![1, 2, 3];
         let timeout = Duration::from_millis(100);
@@ -576,7 +576,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_leader_failover() {
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         // Scenario: Leader 1 commits entries, then "fails", Node 2 becomes new leader
         let node_ids = vec![1, 2, 3];
@@ -643,7 +643,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_leader_isolated_cannot_commit() {
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         // Leader gets partitioned from majority - cannot commit new entries
         let node_ids = vec![1, 2, 3];
@@ -691,7 +691,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_split_brain_prevention() {
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         // Two nodes think they're candidates, only one can become leader
         let node_ids = vec![1, 2, 3];
@@ -741,7 +741,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_partitioned_node_rejoins() {
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         // Node 3 is partitioned, misses some entries, then rejoins and catches up
         let node_ids = vec![1, 2, 3];
@@ -803,7 +803,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_stale_leader_steps_down() {
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         // Old leader (partitioned) tries to replicate, sees higher term, steps down
         let node_ids = vec![1, 2, 3];
@@ -858,7 +858,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_candidate_rejects_commands() {
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         // A candidate should reject client commands (only leaders accept)
         let node_ids = vec![1, 2, 3];
@@ -901,7 +901,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_command_fails_when_leader_loses_leadership() {
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         // Leader starts replicating, but steps down mid-replication
         // when it sees a higher term from a peer
@@ -963,7 +963,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_entry_applied_when_quorum_reached() {
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         let node_ids = vec![1, 2, 3];
         let timeout = Duration::from_millis(100);
@@ -1035,7 +1035,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_entry_not_applied_without_quorum() {
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         let node_ids = vec![1, 2, 3];
         let timeout = Duration::from_millis(100);
@@ -1087,7 +1087,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_follower_applies_entry_on_commit_notification() {
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         let node_ids = vec![1, 2, 3];
         let timeout = Duration::from_millis(100);
@@ -1198,8 +1198,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_state_machine_recovery_after_reelection() {
-        use crate::raft_core::NOOP_COMMAND;
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::core::raft_core::NOOP_COMMAND;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         // Scenario: Leader 1 commits entries, then fails.
         // Leader 2 wins election and appends NOOP.
@@ -1308,8 +1308,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_uncommitted_entries_committed_via_noop() {
-        use crate::raft_core::NOOP_COMMAND;
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::core::raft_core::NOOP_COMMAND;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         // Scenario: 5-node cluster. Leader 1 replicates entries to only ONE follower.
         // 2/5 is minority, so entries are NOT committed. Leader 1 crashes.
@@ -1455,8 +1455,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_fresh_node_catches_up_from_empty() {
-        use crate::raft_core::NOOP_COMMAND;
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::core::raft_core::NOOP_COMMAND;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         // Scenario: Node 3 starts with empty log while leader has committed entries.
         // When node 3 receives heartbeats, it catches up on all entries.

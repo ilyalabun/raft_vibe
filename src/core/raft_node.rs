@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::raft_core::{AppendEntriesArgs, RaftCore, RaftState, RequestVoteArgs};
+use super::raft_core::{AppendEntriesArgs, RaftCore, RaftState, RequestVoteArgs};
 use crate::transport::Transport;
 
 /// Shared reference to RaftCore
@@ -229,8 +229,8 @@ impl<T: Transport> RaftNode<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_memory::MemoryStorage;
-    use crate::transport_inmemory::create_cluster;
+    use crate::storage::memory::MemoryStorage;
+    use crate::transport::inmemory::create_cluster;
 
     /// Helper to create RaftCore with MemoryStorage for tests
     fn new_test_core(id: u64, peers: Vec<u64>) -> RaftCore {
@@ -368,7 +368,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_heartbeat_catches_up_followers() {
-        use crate::raft_core::NOOP_COMMAND;
+        use crate::core::raft_core::NOOP_COMMAND;
 
         let node_ids = vec![1, 2, 3];
         let (mut transports, mut handles) = create_cluster(&node_ids);
@@ -471,7 +471,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_election_with_one_peer_timeout() {
         use std::time::Duration;
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         // In a 3-node cluster, need 2 votes (self + 1 peer)
         let node_ids = vec![1, 2, 3];
@@ -505,7 +505,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_replication_with_one_peer_timeout() {
         use std::time::Duration;
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         let node_ids = vec![1, 2, 3];
         let timeout = Duration::from_millis(100);
@@ -550,7 +550,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_heartbeat_with_timeout() {
         use std::time::Duration;
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         let node_ids = vec![1, 2, 3];
         let timeout = Duration::from_millis(100);
@@ -593,7 +593,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_all_peers_timeout_election_fails() {
         use std::time::Duration;
-        use crate::transport_inmemory::create_cluster_with_timeout;
+        use crate::transport::inmemory::create_cluster_with_timeout;
 
         let node_ids = vec![1, 2, 3];
         let timeout = Duration::from_millis(100);

@@ -23,12 +23,12 @@ use axum::{
 };
 use serde::Serialize;
 
-use raft_vibe::client_http::create_client_router_full;
-use raft_vibe::raft_core::RaftCore;
-use raft_vibe::raft_server::RaftServer;
-use raft_vibe::state_machine_kv::{KeyValueStore, SharedKvStore};
-use raft_vibe::storage_file::FileStorage;
-use raft_vibe::transport_http::{create_router, HttpTransport, SharedCore};
+use raft_vibe::api::client_http::create_client_router_full;
+use raft_vibe::core::raft_core::RaftCore;
+use raft_vibe::core::raft_server::RaftServer;
+use raft_vibe::state_machine::kv::{KeyValueStore, SharedKvStore};
+use raft_vibe::storage::file::FileStorage;
+use raft_vibe::transport::http::{create_router, HttpTransport, SharedCore};
 
 fn parse_args() -> (u64, u16, String, HashMap<u64, String>) {
     let args: Vec<String> = env::args().collect();
@@ -154,7 +154,7 @@ async fn handle_dump(
 /// Create a combined router with both Raft RPC and client API routes
 fn create_combined_router(
     raft_core: SharedCore,
-    raft_handle: raft_vibe::raft_server::RaftHandle,
+    raft_handle: raft_vibe::core::raft_server::RaftHandle,
     client_core: SharedCore,
     kv_store: SharedKvStore,
 ) -> Router {

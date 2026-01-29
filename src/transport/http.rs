@@ -15,10 +15,10 @@ use axum::{
 };
 use tokio::sync::Mutex;
 
-use crate::raft_core::{
+use crate::core::raft_core::{
     AppendEntriesArgs, AppendEntriesResult, RaftCore, RequestVoteArgs, RequestVoteResult,
 };
-use crate::transport::{Transport, TransportError};
+use super::{Transport, TransportError};
 
 /// HTTP transport for Raft RPC communication
 pub struct HttpTransport {
@@ -132,7 +132,7 @@ async fn handle_append_entries(
 mod tests {
     use super::*;
     use crate::state_machine::TestStateMachine;
-    use crate::storage_memory::MemoryStorage;
+    use crate::storage::memory::MemoryStorage;
     use tokio::net::TcpListener;
 
     fn new_test_core(id: u64, peers: Vec<u64>) -> RaftCore {

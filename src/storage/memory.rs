@@ -3,8 +3,8 @@
 //! Fast, no side effects, no persistence across restarts.
 //! Perfect for unit tests.
 
-use crate::raft_core::LogEntry;
-use crate::storage::{Storage, StorageError};
+use crate::core::raft_core::LogEntry;
+use super::{Storage, StorageError};
 
 /// In-memory storage implementation
 ///
