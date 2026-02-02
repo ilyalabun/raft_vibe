@@ -1539,4 +1539,657 @@ mod tests {
             assert_eq!(applied[2], "SET b=2");
         }
     }
+
+    /// High-level integration test that uses heartbeats for replication
+    /// Tests that replication continues to work after automatic snapshot
+    #[tokio::test(start_paused = true)]
+    async fn test_snapshot_with_heartbeat_replication() {
+        use crate::state_machine::kv::KeyValueStore;
+        use crate::storage::memory::MemoryStorage;
+        use crate::transport::inmemory::create_cluster_with_timeout;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        // Create cores with KeyValueStore and low snapshot threshold
+        let mut core1 = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+        core1.set_snapshot_threshold(5);
+
+        let mut core2 = RaftCore::new(
+            2,
+            vec![1, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+        core2.set_snapshot_threshold(5);
+
+        let mut core3 = RaftCore::new(
+            3,
+            vec![1, 2],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+        core3.set_snapshot_threshold(5);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let (server1, shared1) = RaftServer::new(core1, transport1);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Node 1 wins election
+        server1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        // === Phase 1: Add entries and use heartbeats to replicate ===
+        // Add 10 entries (will trigger snapshot at 5)
+        for i in 1..=10 {
+            {
+                let mut core = shared1.lock().await;
+                core.append_log_entry(format!("SET k{} v{}", i, i));
+            }
+        }
+
+        // Use heartbeats to replicate all entries
+        // Multiple rounds needed for catch-up
+        for round in 0..15 {
+            let (_, _, _) = tokio::join!(
+                server1.node.send_heartbeat(),
+                handle2.process_one_shared(&shared2),
+                handle3.process_one_shared(&shared3),
+            );
+
+            // Check if all entries committed
+            let commit_idx = shared1.lock().await.commit_index;
+            if commit_idx >= 11 {
+                println!("All entries committed after {} heartbeat rounds", round + 1);
+                break;
+            }
+        }
+
+        // Verify leader state after phase 1
+        {
+            let core = shared1.lock().await;
+            println!("Leader: commit_index={}, snapshot_last_index={}, log.len={}",
+                     core.commit_index, core.snapshot_last_index, core.log.len());
+            assert!(core.snapshot_last_index > 0, "Leader should have taken snapshot");
+            assert!(core.commit_index >= 11, "All 11 entries should be committed (NOOP + 10)");
+        }
+
+        // === Phase 2: Add more entries AFTER snapshot ===
+        for i in 11..=15 {
+            {
+                let mut core = shared1.lock().await;
+                core.append_log_entry(format!("SET k{} v{}", i, i));
+            }
+        }
+
+        // Use heartbeats to replicate the new entries
+        for round in 0..15 {
+            let (_, _, _) = tokio::join!(
+                server1.node.send_heartbeat(),
+                handle2.process_one_shared(&shared2),
+                handle3.process_one_shared(&shared3),
+            );
+
+            // Check if all entries committed
+            let commit_idx = shared1.lock().await.commit_index;
+            let last_log = shared1.lock().await.last_log_index();
+            if commit_idx >= last_log {
+                println!("Phase 2: All entries committed after {} heartbeat rounds", round + 1);
+                break;
+            }
+        }
+
+        // Verify final state
+        {
+            let core1 = shared1.lock().await;
+            let core2 = shared2.lock().await;
+            let core3 = shared3.lock().await;
+
+            let leader_last = core1.last_log_index();
+            println!("Final state:");
+            println!("  Leader: last_log={}, commit={}, snapshot={}",
+                     leader_last, core1.commit_index, core1.snapshot_last_index);
+            println!("  Follower 2: last_log={}, commit={}, snapshot={}",
+                     core2.last_log_index(), core2.commit_index, core2.snapshot_last_index);
+            println!("  Follower 3: last_log={}, commit={}, snapshot={}",
+                     core3.last_log_index(), core3.commit_index, core3.snapshot_last_index);
+
+            // All nodes should have same last_log_index
+            assert_eq!(core2.last_log_index(), leader_last,
+                       "Follower 2 should match leader's last_log_index");
+            assert_eq!(core3.last_log_index(), leader_last,
+                       "Follower 3 should match leader's last_log_index");
+
+            // All entries should be committed
+            assert_eq!(core1.commit_index, leader_last,
+                       "Leader should have committed all entries");
+        }
+    }
+
+    /// Same as test_snapshot_with_heartbeat_replication but with FileStorage
+    #[tokio::test(start_paused = true)]
+    async fn test_snapshot_with_file_storage() {
+        use crate::state_machine::kv::KeyValueStore;
+        use crate::storage::file::FileStorage;
+        use crate::transport::inmemory::create_cluster_with_timeout;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+        use tokio::sync::Mutex;
+
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        // Create temp directories for each node
+        let dir1 = TempDir::new().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        let dir3 = TempDir::new().unwrap();
+
+        // Create cores with FileStorage and low snapshot threshold
+        let mut core1 = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(FileStorage::new(dir1.path().to_str().unwrap()).unwrap()),
+            Box::new(KeyValueStore::new()),
+        );
+        core1.set_snapshot_threshold(5);
+
+        let mut core2 = RaftCore::new(
+            2,
+            vec![1, 3],
+            Box::new(FileStorage::new(dir2.path().to_str().unwrap()).unwrap()),
+            Box::new(KeyValueStore::new()),
+        );
+        core2.set_snapshot_threshold(5);
+
+        let mut core3 = RaftCore::new(
+            3,
+            vec![1, 2],
+            Box::new(FileStorage::new(dir3.path().to_str().unwrap()).unwrap()),
+            Box::new(KeyValueStore::new()),
+        );
+        core3.set_snapshot_threshold(5);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let (server1, shared1) = RaftServer::new(core1, transport1);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Node 1 wins election
+        server1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        // Add 10 entries
+        for i in 1..=10 {
+            {
+                let mut core = shared1.lock().await;
+                core.append_log_entry(format!("SET k{} v{}", i, i));
+            }
+        }
+
+        // Use heartbeats to replicate
+        for round in 0..15 {
+            let (_, _, _) = tokio::join!(
+                server1.node.send_heartbeat(),
+                handle2.process_one_shared(&shared2),
+                handle3.process_one_shared(&shared3),
+            );
+
+            let commit_idx = shared1.lock().await.commit_index;
+            if commit_idx >= 11 {
+                println!("Phase 1 committed after {} rounds", round + 1);
+                break;
+            }
+        }
+
+        // Verify state
+        {
+            let core = shared1.lock().await;
+            println!("Leader: commit={}, snapshot={}, log.len={}",
+                     core.commit_index, core.snapshot_last_index, core.log.len());
+            assert!(core.commit_index >= 11, "Should commit all entries");
+        }
+
+        // Add more entries after snapshot
+        for i in 11..=15 {
+            {
+                let mut core = shared1.lock().await;
+                core.append_log_entry(format!("SET k{} v{}", i, i));
+            }
+        }
+
+        // Replicate with heartbeats
+        for round in 0..15 {
+            let (_, _, _) = tokio::join!(
+                server1.node.send_heartbeat(),
+                handle2.process_one_shared(&shared2),
+                handle3.process_one_shared(&shared3),
+            );
+
+            let commit_idx = shared1.lock().await.commit_index;
+            let last_log = shared1.lock().await.last_log_index();
+            if commit_idx >= last_log {
+                println!("Phase 2 committed after {} rounds", round + 1);
+                break;
+            }
+        }
+
+        // Final verification
+        {
+            let core1 = shared1.lock().await;
+            let core2 = shared2.lock().await;
+            let core3 = shared3.lock().await;
+
+            let leader_last = core1.last_log_index();
+            println!("Final: leader_last={}, commits=({},{},{})",
+                     leader_last, core1.commit_index, core2.commit_index, core3.commit_index);
+
+            assert_eq!(core2.last_log_index(), leader_last);
+            assert_eq!(core3.last_log_index(), leader_last);
+            assert_eq!(core1.commit_index, leader_last);
+        }
+    }
+
+    /// Test where LEADER snapshots first, then sends entries to followers
+    #[tokio::test(start_paused = true)]
+    async fn test_leader_snapshots_before_followers() {
+        use crate::state_machine::kv::KeyValueStore;
+        use crate::storage::memory::MemoryStorage;
+        use crate::transport::inmemory::create_cluster_with_timeout;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        // Leader has LOW threshold (will snapshot at 10)
+        let mut core1 = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+        core1.set_snapshot_threshold(10);
+
+        // Followers have HIGH threshold (won't snapshot)
+        let mut core2 = RaftCore::new(
+            2,
+            vec![1, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+        core2.set_snapshot_threshold(100);
+
+        let mut core3 = RaftCore::new(
+            3,
+            vec![1, 2],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+        core3.set_snapshot_threshold(100);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let (server1, shared1) = RaftServer::new(core1, transport1);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Node 1 wins election
+        server1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        // Add 9 entries (NOOP + 9 = 10 total, will trigger leader snapshot)
+        for i in 1..=9 {
+            {
+                let mut core = shared1.lock().await;
+                core.append_log_entry(format!("SET k{} v{}", i, i));
+            }
+        }
+
+        // Replicate and commit - leader will snapshot
+        for _ in 0..5 {
+            let (_, _, _) = tokio::join!(
+                server1.node.send_heartbeat(),
+                handle2.process_one_shared(&shared2),
+                handle3.process_one_shared(&shared3),
+            );
+        }
+
+        // Verify leader took snapshot but followers didn't
+        {
+            let core1 = shared1.lock().await;
+            let core2 = shared2.lock().await;
+            let core3 = shared3.lock().await;
+
+            println!("After 10 entries:");
+            println!("  Leader: snapshot={}, snapshot_term={}, log.len={}",
+                     core1.snapshot_last_index, core1.snapshot_last_term, core1.log.len());
+            println!("  Follower2: snapshot={}, log.len={}", core2.snapshot_last_index, core2.log.len());
+            println!("  Follower3: snapshot={}, log.len={}", core3.snapshot_last_index, core3.log.len());
+
+            assert!(core1.snapshot_last_index >= 10, "Leader should have snapshot");
+            assert_eq!(core2.snapshot_last_index, 0, "Follower 2 should NOT have snapshot");
+            assert_eq!(core3.snapshot_last_index, 0, "Follower 3 should NOT have snapshot");
+        }
+
+        // Now add entry 11 - leader has snapshotted, followers haven't
+        {
+            let mut core = shared1.lock().await;
+            core.append_log_entry("SET k10 v10".to_string());
+            println!("Leader appended entry {} (snapshot={}, log.len={})",
+                     core.last_log_index(), core.snapshot_last_index, core.log.len());
+        }
+
+        // Send heartbeat - followers should receive entry 11
+        let (_, _, _) = tokio::join!(
+            server1.node.send_heartbeat(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+
+        // Verify entry 11 was replicated
+        {
+            let core1 = shared1.lock().await;
+            let core2 = shared2.lock().await;
+            let core3 = shared3.lock().await;
+
+            println!("After entry 11:");
+            println!("  Leader: last_log={}, commit={}", core1.last_log_index(), core1.commit_index);
+            println!("  Follower2: last_log={}, commit={}", core2.last_log_index(), core2.commit_index);
+            println!("  Follower3: last_log={}, commit={}", core3.last_log_index(), core3.commit_index);
+
+            assert!(core1.commit_index >= 11, "Entry 11 should be committed");
+            assert_eq!(core2.last_log_index(), 11, "Follower 2 should have entry 11");
+            assert_eq!(core3.last_log_index(), 11, "Follower 3 should have entry 11");
+        }
+    }
+
+    /// Test the specific case where followers snapshot BEFORE leader
+    #[tokio::test(start_paused = true)]
+    async fn test_followers_snapshot_before_leader() {
+        use crate::state_machine::kv::KeyValueStore;
+        use crate::storage::memory::MemoryStorage;
+        use crate::transport::inmemory::create_cluster_with_timeout;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        // Leader has HIGH threshold (won't snapshot)
+        let mut core1 = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+        core1.set_snapshot_threshold(100); // Won't trigger
+
+        // Followers have LOW threshold (will snapshot at 10)
+        let mut core2 = RaftCore::new(
+            2,
+            vec![1, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+        core2.set_snapshot_threshold(10);
+
+        let mut core3 = RaftCore::new(
+            3,
+            vec![1, 2],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+        core3.set_snapshot_threshold(10);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let (server1, shared1) = RaftServer::new(core1, transport1);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Node 1 wins election
+        server1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        // Add 10 entries (NOOP + 9 = 10 total, will trigger follower snapshot)
+        for i in 1..=9 {
+            {
+                let mut core = shared1.lock().await;
+                core.append_log_entry(format!("SET k{} v{}", i, i));
+            }
+        }
+
+        // Replicate and commit - followers will snapshot
+        for _ in 0..5 {
+            let (_, _, _) = tokio::join!(
+                server1.node.send_heartbeat(),
+                handle2.process_one_shared(&shared2),
+                handle3.process_one_shared(&shared3),
+            );
+        }
+
+        // Verify followers took snapshot but leader didn't
+        {
+            let core1 = shared1.lock().await;
+            let core2 = shared2.lock().await;
+            let core3 = shared3.lock().await;
+
+            println!("After 10 entries:");
+            println!("  Leader: snapshot_last_index={}, log.len={}", core1.snapshot_last_index, core1.log.len());
+            println!("  Follower2: snapshot_last_index={}, log.len={}", core2.snapshot_last_index, core2.log.len());
+            println!("  Follower3: snapshot_last_index={}, log.len={}", core3.snapshot_last_index, core3.log.len());
+
+            assert_eq!(core1.snapshot_last_index, 0, "Leader should NOT have snapshot");
+            assert!(core2.snapshot_last_index >= 10, "Follower 2 should have snapshot");
+            assert!(core3.snapshot_last_index >= 10, "Follower 3 should have snapshot");
+        }
+
+        // Now add entry 11 - this is where the bug occurs
+        {
+            let mut core = shared1.lock().await;
+            core.append_log_entry("SET k10 v10".to_string());
+            println!("Leader appended entry {}", core.last_log_index());
+        }
+
+        // Send heartbeat - followers should receive entry 11
+        let (_, _, _) = tokio::join!(
+            server1.node.send_heartbeat(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+
+        // Verify entry 11 was replicated
+        {
+            let core1 = shared1.lock().await;
+            let core2 = shared2.lock().await;
+            let core3 = shared3.lock().await;
+
+            println!("After entry 11:");
+            println!("  Leader: last_log={}, commit={}", core1.last_log_index(), core1.commit_index);
+            println!("  Follower2: last_log={}, commit={}", core2.last_log_index(), core2.commit_index);
+            println!("  Follower3: last_log={}, commit={}", core3.last_log_index(), core3.commit_index);
+
+            // Entry 11 should be committed
+            assert!(core1.commit_index >= 11, "Entry 11 should be committed");
+            assert_eq!(core2.last_log_index(), 11, "Follower 2 should have entry 11");
+            assert_eq!(core3.last_log_index(), 11, "Follower 3 should have entry 11");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_replication_continues_after_snapshot() {
+        use crate::state_machine::kv::KeyValueStore;
+        use crate::storage::memory::MemoryStorage;
+        use crate::transport::inmemory::create_cluster_with_timeout;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        // Create cores with KeyValueStore state machine and low snapshot threshold
+        let mut core1 = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+        core1.set_snapshot_threshold(5); // Trigger snapshot after 5 entries
+
+        let mut core2 = RaftCore::new(
+            2,
+            vec![1, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+        core2.set_snapshot_threshold(5);
+
+        let mut core3 = RaftCore::new(
+            3,
+            vec![1, 2],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+        core3.set_snapshot_threshold(5);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let (server1, shared1) = RaftServer::new(core1, transport1);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Node 1 wins election
+        server1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        // === Phase 1: Append entries until snapshot triggers ===
+        // NOOP is entry 1, so we need 4 more entries to reach threshold of 5
+        for i in 1..=6 {
+            {
+                let mut core = shared1.lock().await;
+                core.append_log_entry(format!("SET k{} v{}", i, i));
+            }
+            let idx = i + 1; // Account for NOOP at index 1
+            let (_, _, _) = tokio::join!(
+                server1.node.replicate_to_peers(idx),
+                handle2.process_one_shared(&shared2),
+                handle3.process_one_shared(&shared3),
+            );
+        }
+
+        // Verify entries committed
+        {
+            let core = shared1.lock().await;
+            assert!(core.commit_index >= 5, "Should have committed entries");
+        }
+
+        // Verify snapshot was taken on leader
+        {
+            let core = shared1.lock().await;
+            assert!(core.snapshot_last_index > 0, "Leader should have taken snapshot");
+            println!("Leader snapshot at index {}", core.snapshot_last_index);
+        }
+
+        // === Phase 2: Append more entries AFTER snapshot ===
+        for i in 7..=10 {
+            let idx = {
+                let mut core = shared1.lock().await;
+                core.append_log_entry(format!("SET k{} v{}", i, i));
+                core.last_log_index()
+            };
+            let (_, _, _) = tokio::join!(
+                server1.node.replicate_to_peers(idx),
+                handle2.process_one_shared(&shared2),
+                handle3.process_one_shared(&shared3),
+            );
+        }
+
+        // Get final state
+        let final_log_index = shared1.lock().await.last_log_index();
+
+        // Verify post-snapshot entries were committed
+        {
+            let core = shared1.lock().await;
+            assert!(
+                core.commit_index >= final_log_index,
+                "Should commit all entries after snapshot: commit_index={}, last_log_index={}",
+                core.commit_index,
+                final_log_index
+            );
+        }
+
+        // Verify followers have the entries
+        {
+            let core2 = shared2.lock().await;
+            let core3 = shared3.lock().await;
+
+            // Followers should have entries after their snapshot point
+            println!("Follower 2: snapshot_last_index={}, log.len={}",
+                     core2.snapshot_last_index, core2.log.len());
+            println!("Follower 3: snapshot_last_index={}, log.len={}",
+                     core3.snapshot_last_index, core3.log.len());
+
+            // Check that last_log_index matches leader
+            let leader_last = shared1.lock().await.last_log_index();
+            assert_eq!(core2.last_log_index(), leader_last,
+                       "Follower 2 should have same last_log_index as leader");
+            assert_eq!(core3.last_log_index(), leader_last,
+                       "Follower 3 should have same last_log_index as leader");
+        }
+    }
 }

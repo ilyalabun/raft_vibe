@@ -19,6 +19,20 @@ pub trait StateMachine: Send {
     fn apply(&mut self, command: &str) -> ApplyResult;
 }
 
+/// Snapshotable state machine - supports log compaction
+///
+/// Allows serializing state to bytes and restoring from bytes.
+/// Used for creating snapshots to discard old log entries.
+pub trait Snapshotable: StateMachine {
+    /// Create a snapshot of the current state
+    /// Returns serialized state as bytes
+    fn snapshot(&self) -> Result<Vec<u8>, String>;
+
+    /// Restore state from a snapshot
+    /// Replaces current state with the deserialized snapshot data
+    fn restore(&mut self, data: &[u8]) -> Result<(), String>;
+}
+
 /// Shared record of applied commands for testing
 pub type AppliedCommands = Arc<Mutex<Vec<String>>>;
 
@@ -44,5 +58,20 @@ impl StateMachine for TestStateMachine {
     fn apply(&mut self, command: &str) -> ApplyResult {
         self.applied.lock().unwrap().push(command.to_string());
         Ok(String::new())
+    }
+}
+
+impl Snapshotable for TestStateMachine {
+    fn snapshot(&self) -> Result<Vec<u8>, String> {
+        let applied = self.applied.lock().unwrap().clone();
+        serde_json::to_vec(&applied)
+            .map_err(|e| format!("test state machine snapshot failed: {}", e))
+    }
+
+    fn restore(&mut self, data: &[u8]) -> Result<(), String> {
+        let applied: Vec<String> = serde_json::from_slice(data)
+            .map_err(|e| format!("test state machine restore failed: {}", e))?;
+        *self.applied.lock().unwrap() = applied;
+        Ok(())
     }
 }

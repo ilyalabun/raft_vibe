@@ -1,13 +1,15 @@
 //! File-based storage implementation for Raft persistent state
 //!
-//! Stores state in three files within a directory:
+//! Stores state in four files within a directory:
 //! - `term` - Current term (u64) with checksum
 //! - `voted_for` - Voted for candidate ID (Option<u64>) with checksum
 //! - `log` - Log entries (JSON lines format, each line has checksum)
+//! - `snapshot` - Most recent snapshot (JSON with checksum)
 //!
 //! Uses checksums to detect corruption from partial writes.
 
 use crate::core::raft_core::LogEntry;
+use crate::core::snapshot::Snapshot;
 use super::{Storage, StorageError};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -53,6 +55,10 @@ impl FileStorage {
 
     fn log_path(&self) -> PathBuf {
         self.dir.join("log")
+    }
+
+    fn snapshot_path(&self) -> PathBuf {
+        self.dir.join("snapshot")
     }
 
     /// Write data with checksum: "{data} {crc32_hex}\n"
@@ -244,7 +250,8 @@ impl Storage for FileStorage {
     }
 
     fn truncate_log(&mut self, from_index: u64) -> Result<(), StorageError> {
-        // Load all entries, keep only those before from_index, rewrite file
+        // Remove entries >= from_index, keep entries < from_index
+        // Used for conflict resolution
         let entries = self.load_log()?;
         let keep: Vec<_> = entries
             .into_iter()
@@ -262,6 +269,46 @@ impl Storage for FileStorage {
         }
 
         self.atomic_write(&path, content.as_bytes())
+    }
+
+    fn compact_log(&mut self, before_index: u64) -> Result<(), StorageError> {
+        // Remove entries < before_index, keep entries >= before_index
+        // Used for snapshot-based log compaction
+        let entries = self.load_log()?;
+        let keep: Vec<_> = entries
+            .into_iter()
+            .filter(|e| e.index >= before_index)
+            .collect();
+
+        // Rewrite the log file with checksums
+        let path = self.log_path();
+        let mut content = String::new();
+        for entry in &keep {
+            let json = serde_json::to_string(entry)
+                .map_err(|e| StorageError::Io(format!("serialization error: {}", e)))?;
+            let checksum = crc32(json.as_bytes());
+            content.push_str(&format!("{} {:08x}\n", json, checksum));
+        }
+
+        self.atomic_write(&path, content.as_bytes())
+    }
+
+    fn load_snapshot(&self) -> Result<Option<Snapshot>, StorageError> {
+        let path = self.snapshot_path();
+        match self.read_with_checksum(&path)? {
+            None => Ok(None),
+            Some(json) => {
+                let snapshot: Snapshot = serde_json::from_str(&json)
+                    .map_err(|e| StorageError::Corruption(format!("invalid snapshot: {}", e)))?;
+                Ok(Some(snapshot))
+            }
+        }
+    }
+
+    fn save_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), StorageError> {
+        let json = serde_json::to_string(snapshot)
+            .map_err(|e| StorageError::Io(format!("snapshot serialization error: {}", e)))?;
+        self.write_with_checksum(&self.snapshot_path(), &json)
     }
 }
 
@@ -336,6 +383,25 @@ mod tests {
         let loaded = storage.load_log().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].index, 1);
+    }
+
+    #[test]
+    fn test_file_storage_log_compact() {
+        let (mut storage, _dir) = test_storage();
+
+        let entries = vec![
+            LogEntry { term: 1, index: 1, command: "CMD 1".to_string() },
+            LogEntry { term: 1, index: 2, command: "CMD 2".to_string() },
+            LogEntry { term: 2, index: 3, command: "CMD 3".to_string() },
+        ];
+        storage.append_log_entries(&entries).unwrap();
+
+        storage.compact_log(2).unwrap();
+
+        let loaded = storage.load_log().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].index, 2);
+        assert_eq!(loaded[1].index, 3);
     }
 
     #[test]
@@ -420,5 +486,84 @@ mod tests {
         // Test vector: "123456789" should have CRC32 = 0xCBF43926
         let data = b"123456789";
         assert_eq!(crc32(data), 0xCBF43926);
+    }
+
+    #[test]
+    fn test_file_storage_snapshot() {
+        use crate::core::snapshot::{Snapshot, SnapshotMetadata};
+
+        let (mut storage, _dir) = test_storage();
+
+        // Initially no snapshot
+        assert!(storage.load_snapshot().unwrap().is_none());
+
+        // Save a snapshot
+        let snapshot = Snapshot {
+            metadata: SnapshotMetadata {
+                last_included_index: 10,
+                last_included_term: 2,
+            },
+            data: vec![1, 2, 3, 4, 5],
+        };
+        storage.save_snapshot(&snapshot).unwrap();
+
+        // Load it back
+        let loaded = storage.load_snapshot().unwrap().unwrap();
+        assert_eq!(loaded.metadata.last_included_index, 10);
+        assert_eq!(loaded.metadata.last_included_term, 2);
+        assert_eq!(loaded.data, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_file_storage_snapshot_persistence() {
+        use crate::core::snapshot::{Snapshot, SnapshotMetadata};
+
+        let dir = TempDir::new().unwrap();
+
+        // First instance - save snapshot
+        {
+            let mut storage = FileStorage::new(dir.path()).unwrap();
+            let snapshot = Snapshot {
+                metadata: SnapshotMetadata {
+                    last_included_index: 100,
+                    last_included_term: 5,
+                },
+                data: vec![10, 20, 30],
+            };
+            storage.save_snapshot(&snapshot).unwrap();
+        }
+
+        // Second instance - load snapshot (simulates restart)
+        {
+            let storage = FileStorage::new(dir.path()).unwrap();
+            let loaded = storage.load_snapshot().unwrap().unwrap();
+            assert_eq!(loaded.metadata.last_included_index, 100);
+            assert_eq!(loaded.metadata.last_included_term, 5);
+            assert_eq!(loaded.data, vec![10, 20, 30]);
+        }
+    }
+
+    #[test]
+    fn test_detects_corrupted_snapshot() {
+        use crate::core::snapshot::{Snapshot, SnapshotMetadata};
+
+        let dir = TempDir::new().unwrap();
+        let mut storage = FileStorage::new(dir.path()).unwrap();
+
+        let snapshot = Snapshot {
+            metadata: SnapshotMetadata {
+                last_included_index: 10,
+                last_included_term: 2,
+            },
+            data: vec![1, 2, 3],
+        };
+        storage.save_snapshot(&snapshot).unwrap();
+
+        // Corrupt the snapshot file
+        let snapshot_path = dir.path().join("snapshot");
+        fs::write(&snapshot_path, "{\"bad\":\"data\"} 12345678\n").unwrap();
+
+        let result = storage.load_snapshot();
+        assert!(matches!(result, Err(StorageError::Corruption(_))));
     }
 }

@@ -6,4 +6,4 @@
 pub mod kv;
 pub mod traits;
 
-pub use traits::{AppliedCommands, ApplyResult, StateMachine, TestStateMachine};
+pub use traits::{AppliedCommands, ApplyResult, Snapshotable, StateMachine, TestStateMachine};

@@ -16,7 +16,8 @@ use axum::{
 use tokio::sync::Mutex;
 
 use crate::core::raft_core::{
-    AppendEntriesArgs, AppendEntriesResult, RaftCore, RequestVoteArgs, RequestVoteResult,
+    AppendEntriesArgs, AppendEntriesResult, InstallSnapshotArgs, InstallSnapshotResult,
+    RaftCore, RequestVoteArgs, RequestVoteResult,
 };
 use super::{Transport, TransportError};
 
@@ -97,6 +98,34 @@ impl Transport for HttpTransport {
             .await
             .map_err(|_| TransportError::ConnectionFailed)
     }
+
+    async fn install_snapshot(
+        &self,
+        target: u64,
+        args: InstallSnapshotArgs,
+    ) -> Result<InstallSnapshotResult, TransportError> {
+        let addr = self.peers.get(&target).ok_or(TransportError::NodeNotFound)?;
+        let url = format!("http://{}/raft/install_snapshot", addr);
+
+        let response = self
+            .client
+            .post(&url)
+            .json(&args)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    TransportError::Timeout
+                } else {
+                    TransportError::ConnectionFailed
+                }
+            })?;
+
+        response
+            .json::<InstallSnapshotResult>()
+            .await
+            .map_err(|_| TransportError::ConnectionFailed)
+    }
 }
 
 /// Shared state for the HTTP server
@@ -107,6 +136,7 @@ pub fn create_router(core: SharedCore) -> Router {
     Router::new()
         .route("/raft/request_vote", post(handle_request_vote))
         .route("/raft/append_entries", post(handle_append_entries))
+        .route("/raft/install_snapshot", post(handle_install_snapshot))
         .with_state(core)
 }
 
@@ -126,6 +156,15 @@ async fn handle_append_entries(
     let mut core = core.lock().await;
     let output = core.handle_append_entries(&args);
     (StatusCode::OK, Json(output.result))
+}
+
+async fn handle_install_snapshot(
+    State(core): State<SharedCore>,
+    Json(args): Json<InstallSnapshotArgs>,
+) -> Json<InstallSnapshotResult> {
+    let mut core = core.lock().await;
+    let result = core.handle_install_snapshot(&args);
+    Json(result)
 }
 
 #[cfg(test)]

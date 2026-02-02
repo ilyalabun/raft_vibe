@@ -8,7 +8,7 @@ use tokio::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::state_machine::StateMachine;
+use crate::state_machine::Snapshotable;
 use crate::storage::Storage;
 
 /// Special no-op command appended by leaders on election.
@@ -94,12 +94,36 @@ pub struct HandleAppendEntriesOutput {
     pub leader_id: Option<u64>,
 }
 
+/// InstallSnapshot RPC arguments
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotArgs {
+    /// Leader's term
+    pub term: u64,
+    /// Leader's ID
+    pub leader_id: u64,
+    /// Last log index included in snapshot
+    pub last_included_index: u64,
+    /// Term of last included entry
+    pub last_included_term: u64,
+    /// Snapshot data
+    pub data: Vec<u8>,
+}
+
+/// InstallSnapshot RPC results
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum InstallSnapshotResult {
+    /// Snapshot was successfully installed
+    Success { term: u64 },
+    /// Snapshot installation failed
+    Failed { term: u64, reason: String },
+}
+
 /// Core Raft state machine (sync, transport-agnostic)
 pub struct RaftCore {
     // Storage backend for persistent state
     storage: Box<dyn Storage>,
-    // State machine to apply committed entries to
-    state_machine: Box<dyn StateMachine>,
+    // State machine to apply committed entries to (must support snapshots)
+    state_machine: Box<dyn Snapshotable>,
 
     // Persistent state on all servers (updated on stable storage before responding to RPCs)
     // These are cached in memory for fast access, but always persisted via storage
@@ -109,6 +133,10 @@ pub struct RaftCore {
     pub voted_for: Option<u64>,
     /// Log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
     pub log: Vec<LogEntry>,
+    /// Last log index included in snapshot (0 if no snapshot)
+    pub snapshot_last_index: u64,
+    /// Term of the last log entry included in snapshot (0 if no snapshot)
+    pub snapshot_last_term: u64,
 
     // Volatile state on all servers
     /// Index of highest log entry known to be committed (initialized to 0, increases monotonically)
@@ -135,21 +163,45 @@ pub struct RaftCore {
     pub current_leader: Option<u64>,
     /// Last time we received a valid heartbeat from leader (for election timeout)
     pub last_heartbeat: Instant,
+    /// Number of applied log entries before triggering automatic snapshot (0 = disabled)
+    snapshot_threshold: u64,
 }
 
 impl RaftCore {
     /// Create a new Raft core with the given storage backend and state machine
-    /// Loads persistent state (term, voted_for, log) from storage
+    /// Loads persistent state (term, voted_for, log, snapshot) from storage
+    /// Restores state machine from snapshot if one exists
     pub fn new(
         id: u64,
         peers: Vec<u64>,
         storage: Box<dyn Storage>,
-        state_machine: Box<dyn StateMachine>,
+        mut state_machine: Box<dyn Snapshotable>,
     ) -> Self {
         // Load persistent state from storage
         let current_term = storage.load_term().expect("failed to load term from storage");
         let voted_for = storage.load_voted_for().expect("failed to load voted_for from storage");
         let log = storage.load_log().expect("failed to load log from storage");
+
+        // Load snapshot and restore state machine (if exists)
+        let (snapshot_last_index, snapshot_last_term) = match storage.load_snapshot() {
+            Ok(Some(snapshot)) => {
+                let last_index = snapshot.metadata.last_included_index;
+                let last_term = snapshot.metadata.last_included_term;
+
+                // Restore state machine from snapshot
+                state_machine.restore(&snapshot.data)
+                    .expect("failed to restore state machine from snapshot");
+
+                (last_index, last_term)
+            }
+            Ok(None) => (0, 0),
+            Err(e) => panic!("failed to load snapshot from storage: {}", e),
+        };
+
+        // commit_index and last_applied should be at least snapshot_last_index
+        // since all entries in the snapshot are committed and applied
+        let commit_index = snapshot_last_index;
+        let last_applied = snapshot_last_index;
 
         RaftCore {
             storage,
@@ -157,8 +209,10 @@ impl RaftCore {
             current_term,
             voted_for,
             log,
-            commit_index: 0,
-            last_applied: 0,
+            snapshot_last_index,
+            snapshot_last_term,
+            commit_index,
+            last_applied,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             id,
@@ -167,7 +221,14 @@ impl RaftCore {
             votes_received: Vec::new(),
             current_leader: None,
             last_heartbeat: Instant::now(),
+            snapshot_threshold: 1000, // Default: snapshot every 1000 entries
         }
+    }
+
+    /// Set the snapshot threshold (number of applied entries before auto-snapshot)
+    /// Set to 0 to disable automatic snapshots
+    pub fn set_snapshot_threshold(&mut self, threshold: u64) {
+        self.snapshot_threshold = threshold;
     }
 
     // === Persistence helpers ===
@@ -205,21 +266,35 @@ impl RaftCore {
         }
     }
 
-    /// Get the last log index (0 if log is empty)
+    /// Get the last log index (returns snapshot_last_index if log is empty)
     pub fn last_log_index(&self) -> u64 {
         if self.log.is_empty() {
-            0
+            self.snapshot_last_index
         } else {
             self.log.last().unwrap().index
         }
     }
 
-    /// Get the term of the last log entry (0 if log is empty)
+    /// Get the term of the last log entry (returns snapshot_last_term if log is empty)
     pub fn last_log_term(&self) -> u64 {
         if self.log.is_empty() {
-            0
+            self.snapshot_last_term
         } else {
             self.log.last().unwrap().term
+        }
+    }
+
+    /// Get a log entry by its index, accounting for snapshot offset
+    /// Returns None if the entry is in the snapshot or beyond the log
+    fn get_log_entry(&self, index: u64) -> Option<&LogEntry> {
+        if index <= self.snapshot_last_index {
+            // Entry is covered by snapshot
+            None
+        } else {
+            // Entry should be in log Vec
+            // log[0] is entry at index (snapshot_last_index + 1)
+            let offset = (index - self.snapshot_last_index - 1) as usize;
+            self.log.get(offset)
         }
     }
 
@@ -312,11 +387,10 @@ impl RaftCore {
                 // If current log is not up-to-date, return false
                 if append_req.prev_log_index > self.last_log_index() {
                     false
-                } else {
-                    // Check if the entry at prev_log_index has the correct term
-                    // Note: log is 0-indexed, but prev_log_index is 1-indexed
-                    let log_index = (append_req.prev_log_index - 1) as usize;
-                    if log_index >= self.log.len() || self.log[log_index].term != append_req.prev_log_term {
+                } else if append_req.prev_log_index == self.snapshot_last_index {
+                    // prev_log_index is exactly at snapshot boundary
+                    // Check that the term matches the snapshot
+                    if append_req.prev_log_term != self.snapshot_last_term {
                         false
                     } else {
                         // Process each new entry
@@ -333,6 +407,32 @@ impl RaftCore {
                         }
 
                         true
+                    }
+                } else {
+                    // Check if the entry at prev_log_index has the correct term
+                    // Need to find it in the log (accounting for snapshot offset)
+                    if let Some(entry) = self.get_log_entry(append_req.prev_log_index) {
+                        if entry.term != append_req.prev_log_term {
+                            false
+                        } else {
+                            // Process each new entry
+                            self.apply_entries(&append_req.entries);
+
+                            // If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+                            if append_req.leader_commit > self.commit_index {
+                                self.commit_index = std::cmp::min(
+                                    append_req.leader_commit,
+                                    self.last_log_index(),
+                                );
+                                // Apply committed entries to state machine
+                                self.apply_committed_entries();
+                            }
+
+                            true
+                        }
+                    } else {
+                        // Entry not found in log or snapshot
+                        false
                     }
                 }
             } else {
@@ -366,7 +466,14 @@ impl RaftCore {
     /// Apply entries from AppendEntries RPC, handling conflicts and persistence
     fn apply_entries(&mut self, entries: &[LogEntry]) {
         for entry in entries {
-            let entry_idx = (entry.index - 1) as usize;
+            // Skip entries already in snapshot
+            if entry.index <= self.snapshot_last_index {
+                continue;
+            }
+
+            // Calculate position in in-memory log accounting for snapshot offset
+            // log[0] represents entry at index (snapshot_last_index + 1)
+            let entry_idx = (entry.index - self.snapshot_last_index - 1) as usize;
 
             if entry_idx < self.log.len() {
                 // Entry exists at this index
@@ -383,6 +490,86 @@ impl RaftCore {
                 self.persist_log_entry(entry.clone());
                 println!("[NODE {}] Replicated entry {} (term {}): {}", self.id, entry.index, entry.term, entry.command);
             }
+        }
+    }
+
+    /// Handle InstallSnapshot RPC
+    pub fn handle_install_snapshot(&mut self, args: &InstallSnapshotArgs) -> InstallSnapshotResult {
+        use crate::core::snapshot::Snapshot;
+
+        // Reply immediately if term < currentTerm
+        if args.term < self.current_term {
+            return InstallSnapshotResult::Failed {
+                term: self.current_term,
+                reason: "stale term".to_string(),
+            };
+        }
+
+        // Update term if we see a higher term
+        if args.term > self.current_term {
+            self.update_term(args.term);
+            self.state = RaftState::Follower;
+        }
+
+        // Reset election timeout - we heard from valid leader
+        self.last_heartbeat = Instant::now();
+        self.current_leader = Some(args.leader_id);
+
+        // If snapshot is older than what we have, ignore it
+        if args.last_included_index <= self.snapshot_last_index {
+            return InstallSnapshotResult::Failed {
+                term: self.current_term,
+                reason: format!(
+                    "snapshot too old: {} <= {}",
+                    args.last_included_index, self.snapshot_last_index
+                ),
+            };
+        }
+
+        // STEP 1: Save snapshot to storage FIRST (before modifying state machine)
+        // This ensures disk and memory stay consistent
+        let snapshot = Snapshot {
+            metadata: crate::core::snapshot::SnapshotMetadata {
+                last_included_index: args.last_included_index,
+                last_included_term: args.last_included_term,
+            },
+            data: args.data.clone(),
+        };
+
+        if let Err(e) = self.storage.save_snapshot(&snapshot) {
+            return InstallSnapshotResult::Failed {
+                term: self.current_term,
+                reason: format!("failed to save snapshot: {}", e),
+            };
+        }
+
+        // STEP 2: Restore state machine (snapshot is safely on disk)
+        // If this fails, we panic - we've saved snapshot but can't apply it
+        self.state_machine
+            .restore(&args.data)
+            .expect("failed to restore state machine from snapshot - node is in inconsistent state");
+
+        // STEP 3: Update metadata (both save and restore succeeded)
+        self.snapshot_last_index = args.last_included_index;
+        self.snapshot_last_term = args.last_included_term;
+
+        // Discard log entries covered by snapshot
+        // Keep only entries with index > last_included_index
+        self.log.retain(|entry| entry.index > args.last_included_index);
+
+        // Compact log in storage (keep entries after snapshot)
+        let _ = self.storage.compact_log(args.last_included_index + 1);
+
+        // Update commit_index and last_applied
+        if args.last_included_index > self.commit_index {
+            self.commit_index = args.last_included_index;
+        }
+        if args.last_included_index > self.last_applied {
+            self.last_applied = args.last_included_index;
+        }
+
+        InstallSnapshotResult::Success {
+            term: self.current_term,
         }
     }
 
@@ -456,15 +643,106 @@ impl RaftCore {
     /// Apply committed entries to the state machine
     /// Updates last_applied to match commit_index
     /// Returns vec of (index, result) for each entry applied
+    ///
+    /// Automatically triggers snapshot if:
+    /// - Snapshot threshold is configured (> 0)
+    /// - Node is a leader
+    /// - Number of entries since last snapshot >= threshold
     pub fn apply_committed_entries(&mut self) -> Vec<(u64, Result<String, String>)> {
         let mut results = Vec::new();
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
-            let entry = &self.log[(self.last_applied - 1) as usize];
-            let result = self.state_machine.apply(&entry.command);
-            results.push((self.last_applied, result));
+
+            // Get entry accounting for snapshot offset
+            if let Some(entry) = self.get_log_entry(self.last_applied) {
+                // Clone command to avoid borrow checker issue
+                let command = entry.command.clone();
+                let result = self.state_machine.apply(&command);
+                results.push((self.last_applied, result));
+            } else {
+                // Entry is in snapshot, already applied
+                // This shouldn't happen in normal operation
+                panic!("Trying to apply entry {} which is in snapshot (last_applied should be >= snapshot_last_index)", self.last_applied);
+            }
         }
+
+        // Check if we should trigger an automatic snapshot
+        // All nodes (leaders, followers, candidates) take snapshots independently
+        // to prevent unbounded log growth. Leaders additionally send snapshots
+        // to followers that fall behind via InstallSnapshot RPC.
+        if self.snapshot_threshold > 0 {
+            let entries_since_snapshot = self.last_applied - self.snapshot_last_index;
+            if entries_since_snapshot >= self.snapshot_threshold {
+                println!("[NODE {}] Automatic snapshot triggered ({} entries since last snapshot)",
+                         self.id, entries_since_snapshot);
+                if let Err(e) = self.take_snapshot() {
+                    eprintln!("[NODE {}] Auto-snapshot failed: {}", self.id, e);
+                }
+            }
+        }
+
         results
+    }
+
+    /// Take a snapshot of the state machine up to last_applied
+    /// Discards log entries covered by the snapshot
+    pub fn take_snapshot(&mut self) -> Result<(), String> {
+        use crate::core::snapshot::{Snapshot, SnapshotMetadata};
+
+        if self.last_applied == 0 {
+            return Err("No entries applied yet, cannot snapshot".to_string());
+        }
+
+        if self.last_applied <= self.snapshot_last_index {
+            return Err(format!(
+                "Already have snapshot up to index {}, last_applied is {}",
+                self.snapshot_last_index, self.last_applied
+            ));
+        }
+
+        // Get term of last applied entry (must be in log since last_applied > snapshot_last_index)
+        let last_applied_term = self.get_log_entry(self.last_applied)
+            .map(|e| e.term)
+            .ok_or_else(|| "Cannot find last_applied entry".to_string())?;
+
+        // Snapshot the state machine
+        let snapshot_data = self.state_machine.snapshot()?;
+
+        let snapshot = Snapshot {
+            metadata: SnapshotMetadata {
+                last_included_index: self.last_applied,
+                last_included_term: last_applied_term,
+            },
+            data: snapshot_data,
+        };
+
+        // Save to storage
+        self.storage
+            .save_snapshot(&snapshot)
+            .map_err(|e| format!("Failed to save snapshot: {}", e))?;
+
+        // Update snapshot metadata
+        self.snapshot_last_index = snapshot.metadata.last_included_index;
+        self.snapshot_last_term = snapshot.metadata.last_included_term;
+
+        // Discard log entries covered by snapshot
+        // Keep entries after last_applied
+        let keep_from = self.snapshot_last_index + 1;
+        self.storage
+            .compact_log(keep_from)
+            .map_err(|e| format!("Failed to compact log: {}", e))?;
+
+        // Update in-memory log
+        self.log.retain(|entry| entry.index >= keep_from);
+
+        println!("[NODE {}] Snapshot taken at {}:{}", self.id, self.snapshot_last_index, self.snapshot_last_term);
+        Ok(())
+    }
+
+    /// Load the current snapshot from storage
+    /// Returns None if no snapshot exists
+    pub fn load_snapshot(&self) -> Result<Option<crate::core::snapshot::Snapshot>, crate::storage::StorageError> {
+        self.storage.load_snapshot()
     }
 
     /// Process a RequestVote response (called by candidate)
@@ -567,7 +845,7 @@ impl RaftCore {
 
         // Raft safety: Only commit entries from current term (Section 5.4.2)
         // Previous term entries are committed indirectly when a current-term entry is committed
-        let entry_term = self.log.get((entry_index - 1) as usize).map(|e| e.term);
+        let entry_term = self.get_log_entry(entry_index).map(|e| e.term);
         if entry_term != Some(self.current_term) {
             return (None, Vec::new()); // Cannot commit entries from previous terms directly
         }
@@ -599,6 +877,7 @@ impl RaftCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state_machine::TestStateMachine;
     use crate::storage::memory::MemoryStorage;
 
     /// Helper to create RaftCore with MemoryStorage for tests
@@ -2226,5 +2505,719 @@ mod tests {
             assert_eq!(applied[3], "SET z=3");
         }
     }
-}
 
+    #[test]
+    fn test_take_snapshot_basic() {
+        use crate::state_machine::kv::KeyValueStore;
+
+        let mut node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+
+        node.become_leader();
+        node.append_log_entry("SET x 1".to_string());
+        node.append_log_entry("SET y 2".to_string());
+        node.append_log_entry("SET z 3".to_string());
+
+        // Apply entries
+        node.commit_index = 3;
+        node.apply_committed_entries();
+        assert_eq!(node.last_applied, 3);
+        assert_eq!(node.log.len(), 4); // NOOP + 3 commands
+
+        // Take snapshot
+        node.take_snapshot().unwrap();
+
+        // Verify snapshot metadata
+        assert_eq!(node.snapshot_last_index, 3);
+        assert_eq!(node.snapshot_last_term, 0); // Term is 0 in test
+
+        // Verify log was truncated (should keep only entry 4)
+        assert_eq!(node.log.len(), 1);
+        assert_eq!(node.log[0].index, 4);
+
+        // Verify last_log_index still returns correct value
+        assert_eq!(node.last_log_index(), 4);
+    }
+
+    #[test]
+    fn test_take_snapshot_no_entries_applied() {
+        let mut node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(TestStateMachine::new()),
+        );
+
+        node.become_leader();
+        node.append_log_entry("SET x=1".to_string());
+
+        // Try to snapshot without applying anything
+        let result = node.take_snapshot();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No entries applied"));
+    }
+
+    #[test]
+    fn test_take_snapshot_already_snapshotted() {
+        let mut node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(TestStateMachine::new()),
+        );
+
+        node.become_leader();
+        node.append_log_entry("SET x=1".to_string());
+        node.commit_index = 2;
+        node.apply_committed_entries();
+
+        // Take first snapshot
+        node.take_snapshot().unwrap();
+        assert_eq!(node.snapshot_last_index, 2);
+
+        // Try to snapshot again at same point
+        let result = node.take_snapshot();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Already have snapshot"));
+    }
+
+    #[test]
+    fn test_snapshot_restores_state_machine_on_startup() {
+        use crate::state_machine::kv::{KeyValueStore, SharedKvStore};
+        use std::sync::{Arc, Mutex};
+
+        // Create a KV store, add data, and create snapshot manually
+        let kv1 = KeyValueStore::new();
+        let mut node1 = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(kv1),
+        );
+
+        node1.become_leader();
+        node1.append_log_entry("SET key1 value1".to_string());
+        node1.append_log_entry("SET key2 value2".to_string());
+        node1.commit_index = 3;
+        node1.apply_committed_entries();
+        node1.take_snapshot().unwrap();
+
+        // Get the snapshot from storage
+        let snapshot = node1.storage.load_snapshot().unwrap().unwrap();
+
+        // Create new storage with this snapshot
+        let mut storage2 = MemoryStorage::new();
+        storage2.save_snapshot(&snapshot).unwrap();
+
+        // Create new node - should restore state machine from snapshot
+        let kv_restored: SharedKvStore = Arc::new(Mutex::new(KeyValueStore::new()));
+        let node2 = RaftCore::new(
+            2,
+            vec![1, 3],
+            Box::new(storage2),
+            Box::new(kv_restored.clone()),
+        );
+
+        // Verify snapshot metadata loaded
+        assert_eq!(node2.snapshot_last_index, 3);
+        assert_eq!(node2.snapshot_last_term, 0);
+
+        // Verify commit_index and last_applied set correctly
+        assert_eq!(node2.commit_index, 3);
+        assert_eq!(node2.last_applied, 3);
+
+        // Verify state machine was restored
+        let kv = kv_restored.lock().unwrap();
+        assert_eq!(kv.get("key1"), Some("value1".to_string()));
+        assert_eq!(kv.get("key2"), Some("value2".to_string()));
+    }
+
+    #[test]
+    fn test_apply_entries_after_snapshot_restoration() {
+        use crate::state_machine::kv::{KeyValueStore, SharedKvStore};
+        use std::sync::{Arc, Mutex};
+
+        // Create node, take snapshot
+        let mut node1 = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+
+        node1.become_leader();
+        node1.append_log_entry("SET old data".to_string());
+        node1.commit_index = 2;
+        node1.apply_committed_entries();
+        node1.take_snapshot().unwrap();
+
+        // Get snapshot
+        let snapshot = node1.storage.load_snapshot().unwrap().unwrap();
+
+        // Create new storage and node with snapshot
+        let mut storage2 = MemoryStorage::new();
+        storage2.save_snapshot(&snapshot).unwrap();
+
+        let kv_restored: SharedKvStore = Arc::new(Mutex::new(KeyValueStore::new()));
+        let mut node2 = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(storage2),
+            Box::new(kv_restored.clone()),
+        );
+
+        assert_eq!(node2.last_applied, 2);
+
+        // Make it a leader and add new entry after snapshot
+        node2.state = RaftState::Leader; // Bypass become_leader to avoid NOOP
+        node2.current_leader = Some(node2.id);
+
+        node2.append_log_entry("SET new entry".to_string());
+        node2.commit_index = 3;
+        node2.apply_committed_entries();
+
+        assert_eq!(node2.last_applied, 3);
+
+        // Verify state machine has both old and new data
+        let kv = kv_restored.lock().unwrap();
+        assert_eq!(kv.get("old"), Some("data".to_string()));
+        assert_eq!(kv.get("new"), Some("entry".to_string()));
+    }
+
+    #[test]
+    fn test_last_log_index_with_snapshot() {
+        let mut node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(TestStateMachine::new()),
+        );
+
+        // Initially no snapshot, empty log
+        assert_eq!(node.last_log_index(), 0);
+        assert_eq!(node.last_log_term(), 0);
+
+        node.become_leader(); // Adds NOOP at index 1
+        node.commit_index = 1;
+        node.apply_committed_entries();
+        node.take_snapshot().unwrap();
+
+        // After snapshot, log is empty but last_log_index should return snapshot_last_index
+        assert_eq!(node.log.len(), 0);
+        assert_eq!(node.last_log_index(), 1);
+        assert_eq!(node.last_log_term(), 0);
+
+        // Add more entries
+        node.append_log_entry("CMD".to_string());
+        assert_eq!(node.last_log_index(), 2);
+    }
+
+    #[test]
+    fn test_get_log_entry_with_snapshot() {
+        let mut node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(TestStateMachine::new()),
+        );
+
+        node.become_leader(); // NOOP at index 1
+        node.append_log_entry("CMD2".to_string()); // index 2
+        node.append_log_entry("CMD3".to_string()); // index 3
+        node.append_log_entry("CMD4".to_string()); // index 4
+
+        node.commit_index = 2;
+        node.apply_committed_entries();
+        node.take_snapshot().unwrap(); // Snapshot up to index 2
+
+        // Entries 1-2 are in snapshot
+        assert!(node.get_log_entry(1).is_none());
+        assert!(node.get_log_entry(2).is_none());
+
+        // Entries 3-4 are still in log
+        assert_eq!(node.get_log_entry(3).unwrap().command, "CMD3");
+        assert_eq!(node.get_log_entry(4).unwrap().command, "CMD4");
+
+        // Beyond log
+        assert!(node.get_log_entry(5).is_none());
+    }
+
+    #[test]
+    fn test_handle_install_snapshot_success() {
+        use crate::state_machine::kv::{KeyValueStore, SharedKvStore};
+        use crate::state_machine::{Snapshotable, StateMachine};
+        use std::sync::{Arc, Mutex};
+
+        // Create node with KV store
+        let kv: SharedKvStore = Arc::new(Mutex::new(KeyValueStore::new()));
+        let mut node = RaftCore::new(
+            2,
+            vec![1, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(kv.clone()),
+        );
+
+        // Create snapshot data
+        let mut source_kv = KeyValueStore::new();
+        source_kv.apply("SET key1 value1").unwrap();
+        source_kv.apply("SET key2 value2").unwrap();
+        let snapshot_data = source_kv.snapshot().unwrap();
+
+        let args = InstallSnapshotArgs {
+            term: 5,
+            leader_id: 1,
+            last_included_index: 10,
+            last_included_term: 4,
+            data: snapshot_data,
+        };
+
+        let result = node.handle_install_snapshot(&args);
+
+        // Should succeed
+        assert!(matches!(result, InstallSnapshotResult::Success { .. }));
+        if let InstallSnapshotResult::Success { term } = result {
+            assert_eq!(term, 5);
+        }
+
+        // Verify snapshot metadata updated
+        assert_eq!(node.snapshot_last_index, 10);
+        assert_eq!(node.snapshot_last_term, 4);
+        assert_eq!(node.commit_index, 10);
+        assert_eq!(node.last_applied, 10);
+
+        // Verify state machine restored
+        let kv_lock = kv.lock().unwrap();
+        assert_eq!(kv_lock.get("key1"), Some("value1".to_string()));
+        assert_eq!(kv_lock.get("key2"), Some("value2".to_string()));
+    }
+
+    #[test]
+    fn test_handle_install_snapshot_stale_term() {
+        let mut node = RaftCore::new(
+            2,
+            vec![1, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(TestStateMachine::new()),
+        );
+
+        node.current_term = 10;
+
+        let args = InstallSnapshotArgs {
+            term: 5, // Stale term
+            leader_id: 1,
+            last_included_index: 10,
+            last_included_term: 4,
+            data: vec![],
+        };
+
+        let result = node.handle_install_snapshot(&args);
+
+        assert!(matches!(result, InstallSnapshotResult::Failed { .. }));
+        if let InstallSnapshotResult::Failed { term, reason } = result {
+            assert_eq!(term, 10);
+            assert!(reason.contains("stale term"));
+        }
+
+        // Should not update anything
+        assert_eq!(node.snapshot_last_index, 0);
+    }
+
+    #[test]
+    fn test_handle_install_snapshot_old_snapshot() {
+        let mut node = RaftCore::new(
+            2,
+            vec![1, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(TestStateMachine::new()),
+        );
+
+        // Node already has a newer snapshot
+        node.snapshot_last_index = 20;
+        node.snapshot_last_term = 5;
+
+        let args = InstallSnapshotArgs {
+            term: 5,
+            leader_id: 1,
+            last_included_index: 10, // Older than current snapshot
+            last_included_term: 4,
+            data: vec![],
+        };
+
+        let result = node.handle_install_snapshot(&args);
+
+        assert!(matches!(result, InstallSnapshotResult::Failed { .. }));
+        if let InstallSnapshotResult::Failed { reason, .. } = result {
+            assert!(reason.contains("too old"));
+        }
+
+        // Should not update
+        assert_eq!(node.snapshot_last_index, 20);
+    }
+
+    #[test]
+    fn test_handle_install_snapshot_discards_old_log_entries() {
+        use crate::state_machine::kv::KeyValueStore;
+        use crate::state_machine::Snapshotable;
+
+        let mut node = RaftCore::new(
+            2,
+            vec![1, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+
+        // Add some log entries
+        node.become_leader();
+        node.append_log_entry("CMD2".to_string());
+        node.append_log_entry("CMD3".to_string());
+        node.append_log_entry("CMD4".to_string());
+        node.append_log_entry("CMD5".to_string());
+
+        assert_eq!(node.log.len(), 5); // NOOP + 4 commands
+
+        // Install snapshot that covers first 3 entries
+        let snapshot_kv = KeyValueStore::new();
+        let snapshot_data = snapshot_kv.snapshot().unwrap();
+
+        let args = InstallSnapshotArgs {
+            term: 1,
+            leader_id: 1,
+            last_included_index: 3,
+            last_included_term: 0,
+            data: snapshot_data,
+        };
+
+        node.handle_install_snapshot(&args);
+
+        // Should keep only entries 4 and 5
+        assert_eq!(node.log.len(), 2);
+        assert_eq!(node.log[0].index, 4);
+        assert_eq!(node.log[1].index, 5);
+    }
+
+    #[test]
+    fn test_handle_install_snapshot_updates_commit_and_applied() {
+        use crate::state_machine::kv::KeyValueStore;
+        use crate::state_machine::Snapshotable;
+
+        let mut node = RaftCore::new(
+            2,
+            vec![1, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+
+        node.commit_index = 5;
+        node.last_applied = 5;
+
+        let snapshot_kv = KeyValueStore::new();
+        let snapshot_data = snapshot_kv.snapshot().unwrap();
+
+        let args = InstallSnapshotArgs {
+            term: 1,
+            leader_id: 1,
+            last_included_index: 10, // Beyond current commit/applied
+            last_included_term: 1,
+            data: snapshot_data,
+        };
+
+        node.handle_install_snapshot(&args);
+
+        // Should update both to snapshot index
+        assert_eq!(node.commit_index, 10);
+        assert_eq!(node.last_applied, 10);
+    }
+
+
+
+    #[test]
+    fn test_automatic_snapshot_triggering() {
+        use crate::state_machine::kv::KeyValueStore;
+
+        let mut node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+
+        // Set a low threshold for testing
+        node.set_snapshot_threshold(5);
+
+        // Become leader
+        node.start_election();
+        node.become_leader();
+
+        // Add 4 entries (NOOP + 3 commands) - below threshold
+        node.append_log_entry("SET k1 v1".to_string());
+        node.append_log_entry("SET k2 v2".to_string());
+        node.append_log_entry("SET k3 v3".to_string());
+
+        // Commit and apply
+        node.commit_index = 4;
+        node.apply_committed_entries();
+
+        // No snapshot yet (4 < 5)
+        assert_eq!(node.snapshot_last_index, 0);
+        assert_eq!(node.log.len(), 4);
+
+        // Add one more entry to hit threshold
+        node.append_log_entry("SET k4 v4".to_string());
+        node.commit_index = 5;
+        node.apply_committed_entries();
+
+        // Should have triggered automatic snapshot
+        assert_eq!(node.snapshot_last_index, 5);
+        assert_eq!(node.snapshot_last_term, 1);
+        assert!(node.log.is_empty()); // All entries compacted
+
+        // Add more entries - threshold resets from snapshot
+        for i in 6..=10 {
+            node.append_log_entry(format!("SET k{} v{}", i, i));
+        }
+        node.commit_index = 10;
+        node.apply_committed_entries();
+
+        // Another snapshot should be triggered (10 - 5 = 5 entries)
+        assert_eq!(node.snapshot_last_index, 10);
+        assert!(node.log.is_empty());
+    }
+
+    #[test]
+    fn test_automatic_snapshot_disabled_when_threshold_is_zero() {
+        use crate::state_machine::kv::KeyValueStore;
+
+        let mut node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+
+        // Disable automatic snapshots
+        node.set_snapshot_threshold(0);
+
+        node.start_election();
+        node.become_leader();
+
+        // Add many entries
+        for i in 1..=100 {
+            node.append_log_entry(format!("SET k{} v{}", i, i));
+        }
+        node.commit_index = 101;
+        node.apply_committed_entries();
+
+        // Should NOT have triggered snapshot
+        assert_eq!(node.snapshot_last_index, 0);
+        assert_eq!(node.log.len(), 101); // NOOP + 100 commands
+    }
+
+    #[test]
+    fn test_automatic_snapshot_on_follower() {
+        use crate::state_machine::kv::KeyValueStore;
+
+        let mut node = RaftCore::new(
+            2,
+            vec![1, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+
+        node.set_snapshot_threshold(5);
+
+        // Node is a follower
+        assert_eq!(node.state, RaftState::Follower);
+
+        // Simulate receiving entries from leader
+        for i in 1..=10 {
+            node.log.push(LogEntry {
+                term: 1,
+                index: i,
+                command: format!("SET k{} v{}", i, i),
+            });
+        }
+        node.commit_index = 10;
+        node.apply_committed_entries();
+
+        // Followers also take snapshots to prevent unbounded log growth
+        assert_eq!(node.snapshot_last_index, 10);
+        assert_eq!(node.snapshot_last_term, 1);
+        assert!(node.log.is_empty()); // All entries compacted
+    }
+
+    #[test]
+    fn test_snapshot_compacts_file_storage() {
+        use crate::state_machine::kv::KeyValueStore;
+        use crate::storage::file::FileStorage;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let storage = FileStorage::new(dir.path().to_str().unwrap()).unwrap();
+
+        let mut node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(storage),
+            Box::new(KeyValueStore::new()),
+        );
+
+        // Become leader and add entries
+        node.start_election();
+        node.become_leader();
+
+        for i in 1..=10 {
+            node.append_log_entry(format!("SET k{} v{}", i, i));
+        }
+
+        // Commit and apply all entries
+        node.commit_index = node.last_log_index();
+        node.apply_committed_entries();
+
+        // Verify log has entries (NOOP + 10 commands = 11 entries)
+        assert_eq!(node.log.len(), 11);
+
+        // Take snapshot
+        node.take_snapshot().unwrap();
+
+        // Verify in-memory log is empty
+        assert!(node.log.is_empty());
+        assert_eq!(node.snapshot_last_index, 11);
+
+        // Verify physical log file is empty
+        let log_entries = node.storage.load_log().unwrap();
+        assert_eq!(log_entries.len(), 0, "Physical log file should be empty after snapshot");
+    }
+
+    #[test]
+    fn test_multiple_snapshots_work() {
+        use crate::state_machine::kv::KeyValueStore;
+
+        let mut node = RaftCore::new(
+            1,
+            vec![2, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+
+        node.set_snapshot_threshold(5);
+
+        // Become leader
+        node.start_election();
+        node.become_leader();
+
+        // Add 5 entries (will trigger snapshot at threshold)
+        for i in 1..=5 {
+            node.append_log_entry(format!("SET k{} v{}", i, i));
+        }
+        node.commit_index = node.last_log_index();
+        node.apply_committed_entries();
+
+        let first_snapshot_index = node.snapshot_last_index;
+        assert!(first_snapshot_index > 0, "First snapshot should have been taken");
+
+        // Add 5 more entries (should trigger second snapshot)
+        for i in 6..=10 {
+            node.append_log_entry(format!("SET k{} v{}", i, i));
+        }
+        node.commit_index = node.last_log_index();
+        node.apply_committed_entries();
+
+        // Second snapshot should have been taken
+        assert!(node.snapshot_last_index > first_snapshot_index,
+                "Second snapshot should have advanced: first={} current={}",
+                first_snapshot_index, node.snapshot_last_index);
+    }
+
+    #[test]
+    fn test_replication_after_compaction() {
+        use crate::state_machine::kv::KeyValueStore;
+
+        // Create leader that has taken a snapshot
+        let mut leader = RaftCore::new(
+            1,
+            vec![2],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+        leader.start_election();
+        leader.become_leader();
+
+        // Add entries 1-10, commit and apply them
+        for i in 1..=10 {
+            leader.append_log_entry(format!("SET k{} v{}", i, i));
+        }
+        leader.commit_index = leader.last_log_index();
+        leader.apply_committed_entries();
+
+        // Take snapshot (NOOP entry 1 + 10 user entries = index 11)
+        leader.take_snapshot().unwrap();
+        let snapshot_idx = leader.snapshot_last_index;
+        assert!(leader.log.is_empty(), "Log should be empty after snapshot");
+
+        // Add 5 more entries after snapshot
+        for i in 1..=5 {
+            leader.append_log_entry(format!("SET k{} v{}", i, i));
+        }
+        assert_eq!(leader.log.len(), 5);
+
+        // Create follower that also has snapshot
+        let mut follower = RaftCore::new(
+            2,
+            vec![1],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+
+        // Give follower the same snapshot
+        follower.snapshot_last_index = snapshot_idx;
+        follower.snapshot_last_term = 1;
+        follower.last_applied = snapshot_idx;
+        follower.commit_index = snapshot_idx;
+
+        // Follower has first 3 entries after snapshot
+        for i in 1..=3 {
+            follower.log.push(LogEntry {
+                term: 1,
+                index: snapshot_idx + i,
+                command: format!("SET k{} v{}", i, i),
+            });
+        }
+        assert_eq!(follower.log.len(), 3);
+
+        // Leader sends AppendEntries with last 2 entries
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 1,
+            prev_log_index: snapshot_idx + 3,
+            prev_log_term: 1,
+            entries: vec![
+                LogEntry { term: 1, index: snapshot_idx + 4, command: "SET k4 v4".to_string() },
+                LogEntry { term: 1, index: snapshot_idx + 5, command: "SET k5 v5".to_string() },
+            ],
+            leader_commit: snapshot_idx + 5,
+        };
+
+        let result = follower.handle_append_entries(&args);
+        assert!(result.result.success);
+
+        // Follower should now have 5 entries (no duplicates!)
+        assert_eq!(follower.log.len(), 5);
+        assert_eq!(follower.log[0].index, snapshot_idx + 1);
+        assert_eq!(follower.log[1].index, snapshot_idx + 2);
+        assert_eq!(follower.log[2].index, snapshot_idx + 3);
+        assert_eq!(follower.log[3].index, snapshot_idx + 4);
+        assert_eq!(follower.log[4].index, snapshot_idx + 5);
+
+        // Send same entries again (idempotent)
+        let result2 = follower.handle_append_entries(&args);
+        assert!(result2.result.success);
+
+        // Should still have exactly 5 entries (no duplicates)
+        assert_eq!(follower.log.len(), 5);
+        assert_eq!(follower.log[4].index, snapshot_idx + 5);
+    }
+}

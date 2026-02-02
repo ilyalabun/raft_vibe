@@ -25,6 +25,7 @@ start_cluster() {
         --port 8001 \
         --data-dir "$DATA_DIR/node1" \
         --peers 2=127.0.0.1:8002,3=127.0.0.1:8003 \
+        --snapshot-threshold 10 \
         > "$LOG_DIR/node1.log" 2>&1 &
     echo $! > "$DATA_DIR/node1.pid"
 
@@ -35,6 +36,7 @@ start_cluster() {
         --port 8002 \
         --data-dir "$DATA_DIR/node2" \
         --peers 1=127.0.0.1:8001,3=127.0.0.1:8003 \
+        --snapshot-threshold 10 \
         > "$LOG_DIR/node2.log" 2>&1 &
     echo $! > "$DATA_DIR/node2.pid"
 
@@ -45,11 +47,15 @@ start_cluster() {
         --port 8003 \
         --data-dir "$DATA_DIR/node3" \
         --peers 1=127.0.0.1:8001,2=127.0.0.1:8002 \
+        --snapshot-threshold 10 \
         > "$LOG_DIR/node3.log" 2>&1 &
     echo $! > "$DATA_DIR/node3.pid"
 
     echo ""
     echo "Cluster started!"
+    echo ""
+    echo "Configuration:"
+    echo "  Snapshot threshold: 10 entries (snapshots trigger frequently for testing)"
     echo ""
     echo "Node endpoints:"
     echo "  Node 1: http://127.0.0.1:8001"
@@ -68,7 +74,13 @@ start_cluster() {
     echo "       -H 'Content-Type: application/json' \\"
     echo "       -d '{\"command\": \"SET mykey myvalue\"}'"
     echo ""
+    echo "  # Submit many commands to see automatic snapshots:"
+    echo "  for i in {1..15}; do curl -X POST http://127.0.0.1:8001/client/submit \\"
+    echo "       -H 'Content-Type: application/json' \\"
+    echo "       -d \"{\\\"command\\\": \\\"SET key\$i value\$i\\\"}\"; done"
+    echo ""
     echo "Logs: $LOG_DIR/"
+    echo "  Watch for: '[NODE X] Automatic snapshot triggered'"
     echo "To stop: ./run_cluster.sh stop"
 }
 
@@ -164,6 +176,7 @@ start_node() {
         --port "$port" \
         --data-dir "$DATA_DIR/node$node_id" \
         --peers "$peers" \
+        --snapshot-threshold 10 \
         > "$LOG_DIR/node$node_id.log" 2>&1 &
     echo $! > "$DATA_DIR/node$node_id.pid"
     echo "Node $node_id started (PID $!)."

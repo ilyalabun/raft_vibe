@@ -3,7 +3,8 @@
 use async_trait::async_trait;
 
 use crate::core::raft_core::{
-    AppendEntriesArgs, AppendEntriesResult, RequestVoteArgs, RequestVoteResult,
+    AppendEntriesArgs, AppendEntriesResult, InstallSnapshotArgs, InstallSnapshotResult,
+    RequestVoteArgs, RequestVoteResult,
 };
 
 /// Transport abstraction for Raft RPC communication
@@ -22,6 +23,13 @@ pub trait Transport: Send + Sync {
         target: u64,
         args: AppendEntriesArgs,
     ) -> Result<AppendEntriesResult, TransportError>;
+
+    /// Send an InstallSnapshot RPC to a peer node
+    async fn install_snapshot(
+        &self,
+        target: u64,
+        args: InstallSnapshotArgs,
+    ) -> Result<InstallSnapshotResult, TransportError>;
 }
 
 /// Errors that can occur during transport operations

@@ -9,11 +9,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use crate::core::raft_core::NOOP_COMMAND;
-use super::{ApplyResult, StateMachine};
+use super::{ApplyResult, Snapshotable, StateMachine};
 
 /// Simple in-memory key-value store
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct KeyValueStore {
     data: HashMap<String, String>,
 }
@@ -45,6 +47,16 @@ impl StateMachine for SharedKvStore {
     }
 }
 
+impl Snapshotable for SharedKvStore {
+    fn snapshot(&self) -> Result<Vec<u8>, String> {
+        self.lock().unwrap().snapshot()
+    }
+
+    fn restore(&mut self, data: &[u8]) -> Result<(), String> {
+        self.lock().unwrap().restore(data)
+    }
+}
+
 impl StateMachine for KeyValueStore {
     fn apply(&mut self, command: &str) -> ApplyResult {
         // Handle no-op command (used by leader on election)
@@ -68,6 +80,22 @@ impl StateMachine for KeyValueStore {
             }
             _ => Err(format!("unknown command: {}", command)),
         }
+    }
+}
+
+impl Snapshotable for KeyValueStore {
+    fn snapshot(&self) -> Result<Vec<u8>, String> {
+        // Clone-then-serialize approach: clone the HashMap (cheap for small data),
+        // then serialize without holding any locks
+        let data_clone = self.data.clone();
+        serde_json::to_vec(&data_clone).map_err(|e| format!("snapshot serialization failed: {}", e))
+    }
+
+    fn restore(&mut self, data: &[u8]) -> Result<(), String> {
+        let restored: HashMap<String, String> = serde_json::from_slice(data)
+            .map_err(|e| format!("snapshot deserialization failed: {}", e))?;
+        self.data = restored;
+        Ok(())
     }
 }
 
@@ -137,5 +165,62 @@ mod tests {
         let result = kv.apply("INVALID command");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown command"));
+    }
+
+    #[test]
+    fn test_snapshot_and_restore() {
+        let mut kv1 = KeyValueStore::new();
+        kv1.apply("SET key1 value1").unwrap();
+        kv1.apply("SET key2 value2").unwrap();
+        kv1.apply("SET key3 value3").unwrap();
+
+        // Take snapshot
+        let snapshot = kv1.snapshot().unwrap();
+
+        // Create new store and restore
+        let mut kv2 = KeyValueStore::new();
+        kv2.restore(&snapshot).unwrap();
+
+        // Verify state matches
+        assert_eq!(kv2.get("key1"), Some("value1".to_string()));
+        assert_eq!(kv2.get("key2"), Some("value2".to_string()));
+        assert_eq!(kv2.get("key3"), Some("value3".to_string()));
+    }
+
+    #[test]
+    fn test_snapshot_empty_store() {
+        let kv = KeyValueStore::new();
+        let snapshot = kv.snapshot().unwrap();
+
+        let mut kv2 = KeyValueStore::new();
+        kv2.restore(&snapshot).unwrap();
+
+        assert_eq!(kv2.all().len(), 0);
+    }
+
+    #[test]
+    fn test_restore_overwrites_existing_data() {
+        let mut kv1 = KeyValueStore::new();
+        kv1.apply("SET original data").unwrap();
+        let snapshot = kv1.snapshot().unwrap();
+
+        let mut kv2 = KeyValueStore::new();
+        kv2.apply("SET existing something").unwrap();
+        kv2.apply("SET other thing").unwrap();
+
+        // Restore should replace all existing data
+        kv2.restore(&snapshot).unwrap();
+
+        assert_eq!(kv2.get("original"), Some("data".to_string()));
+        assert_eq!(kv2.get("existing"), None);
+        assert_eq!(kv2.get("other"), None);
+    }
+
+    #[test]
+    fn test_restore_invalid_data() {
+        let mut kv = KeyValueStore::new();
+        let result = kv.restore(b"invalid json data");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("deserialization failed"));
     }
 }

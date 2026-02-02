@@ -6,7 +6,8 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::core::raft_core::{
-    AppendEntriesArgs, AppendEntriesResult, RaftCore, RequestVoteArgs, RequestVoteResult,
+    AppendEntriesArgs, AppendEntriesResult, InstallSnapshotArgs, InstallSnapshotResult,
+    RaftCore, RequestVoteArgs, RequestVoteResult,
 };
 use super::{Transport, TransportError};
 
@@ -19,6 +20,10 @@ pub(crate) enum Request {
     AppendEntries {
         args: AppendEntriesArgs,
         reply: oneshot::Sender<AppendEntriesResult>,
+    },
+    InstallSnapshot {
+        args: InstallSnapshotArgs,
+        reply: oneshot::Sender<InstallSnapshotResult>,
     },
 }
 
@@ -93,6 +98,31 @@ impl Transport for InMemoryTransport {
             None => reply_rx.await.map_err(|_| TransportError::ConnectionFailed),
         }
     }
+
+    async fn install_snapshot(
+        &self,
+        target: u64,
+        args: InstallSnapshotArgs,
+    ) -> Result<InstallSnapshotResult, TransportError> {
+        let sender = self.senders.get(&target).ok_or(TransportError::NodeNotFound)?;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        sender
+            .send(Request::InstallSnapshot { args, reply: reply_tx })
+            .await
+            .map_err(|_| TransportError::ConnectionFailed)?;
+
+        // Apply timeout if configured
+        match self.timeout {
+            Some(timeout) => {
+                tokio::time::timeout(timeout, reply_rx)
+                    .await
+                    .map_err(|_| TransportError::Timeout)?
+                    .map_err(|_| TransportError::ConnectionFailed)
+            }
+            None => reply_rx.await.map_err(|_| TransportError::ConnectionFailed),
+        }
+    }
 }
 
 /// Handle for a node that processes incoming requests
@@ -138,6 +168,10 @@ impl NodeHandle {
                 let output = node.handle_append_entries(&args);
                 // Transport only returns the result; events are handled locally
                 let _ = reply.send(output.result);
+            }
+            Request::InstallSnapshot { args, reply } => {
+                let result = node.handle_install_snapshot(&args);
+                let _ = reply.send(result);
             }
         }
     }
@@ -399,5 +433,55 @@ mod tests {
         assert!(result2.is_ok());
         assert!(result2.unwrap().vote_granted);
         assert!(matches!(result3, Err(TransportError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn test_install_snapshot() {
+        use crate::state_machine::kv::KeyValueStore;
+        use crate::state_machine::{Snapshotable, StateMachine};
+
+        let node_ids = vec![1, 2, 3];
+        let (transports, mut handles) = create_cluster(&node_ids);
+
+        // Node 2 with KV store to restore snapshot
+        let mut node2 = RaftCore::new(
+            2,
+            vec![1, 3],
+            Box::new(MemoryStorage::new()),
+            Box::new(KeyValueStore::new()),
+        );
+
+        // Node 1 sends snapshot to node 2
+        let transport1 = transports.get(&1).unwrap();
+
+        // Create snapshot data
+        let mut kv = KeyValueStore::new();
+        kv.apply("SET key1 value1").unwrap();
+        kv.apply("SET key2 value2").unwrap();
+        let snapshot_data = kv.snapshot().unwrap();
+
+        let args = InstallSnapshotArgs {
+            term: 1,
+            leader_id: 1,
+            last_included_index: 5,
+            last_included_term: 1,
+            data: snapshot_data,
+        };
+
+        let snapshot_future = transport1.install_snapshot(2, args);
+
+        // Process the request on node 2
+        let handle2 = handles.get_mut(&2).unwrap();
+        let (result, _) = tokio::join!(snapshot_future, handle2.process_one(&mut node2));
+
+        let result = result.unwrap();
+        assert!(matches!(result, InstallSnapshotResult::Success { .. }));
+
+        if let InstallSnapshotResult::Success { term } = result {
+            assert_eq!(term, 1);
+        }
+
+        assert_eq!(node2.snapshot_last_index, 5);
+        assert_eq!(node2.snapshot_last_term, 1);
     }
 }

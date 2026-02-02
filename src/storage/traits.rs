@@ -4,6 +4,7 @@
 //! responding to RPCs: current_term, voted_for, and log entries.
 
 use crate::core::raft_core::LogEntry;
+use crate::core::snapshot::Snapshot;
 use std::fmt;
 
 /// Errors that can occur during storage operations
@@ -59,6 +60,20 @@ pub trait Storage: Send {
     fn append_log_entries(&mut self, entries: &[LogEntry]) -> Result<(), StorageError>;
 
     /// Truncate the log from the given index (inclusive)
-    /// Removes all entries with index >= from_index
+    /// Removes all entries with index >= from_index (keeps entries < from_index)
+    /// Used for conflict resolution in AppendEntries
     fn truncate_log(&mut self, from_index: u64) -> Result<(), StorageError>;
+
+    /// Compact the log by removing entries before the given index
+    /// Removes all entries with index < before_index (keeps entries >= before_index)
+    /// Used for snapshot-based log compaction
+    fn compact_log(&mut self, before_index: u64) -> Result<(), StorageError>;
+
+    /// Load the most recent snapshot from storage
+    /// Returns None if no snapshot has been saved
+    fn load_snapshot(&self) -> Result<Option<Snapshot>, StorageError>;
+
+    /// Save a snapshot to storage
+    /// Must be durable before returning
+    fn save_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), StorageError>;
 }

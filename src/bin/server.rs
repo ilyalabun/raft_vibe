@@ -2,12 +2,15 @@
 //!
 //! Runs a single Raft node with HTTP API for both cluster communication and clients.
 //!
-//! Usage: raft-server --id <NODE_ID> --port <PORT> --data-dir <DIR> --peers <PEER1,PEER2,...>
+//! Usage: raft-server --id <NODE_ID> --port <PORT> --data-dir <DIR> --peers <PEER1,PEER2,...> [--snapshot-threshold N]
 //!
 //! Example for a 3-node cluster:
 //!   Node 1: raft-server --id 1 --port 8001 --data-dir /tmp/raft1 --peers 2=127.0.0.1:8002,3=127.0.0.1:8003
 //!   Node 2: raft-server --id 2 --port 8002 --data-dir /tmp/raft2 --peers 1=127.0.0.1:8001,3=127.0.0.1:8003
 //!   Node 3: raft-server --id 3 --port 8003 --data-dir /tmp/raft3 --peers 1=127.0.0.1:8001,2=127.0.0.1:8002
+//!
+//! Options:
+//!   --snapshot-threshold N    Take snapshot after N entries (default: 1000, set to 0 to disable)
 
 use std::collections::HashMap;
 use std::env;
@@ -30,13 +33,14 @@ use raft_vibe::state_machine::kv::{KeyValueStore, SharedKvStore};
 use raft_vibe::storage::file::FileStorage;
 use raft_vibe::transport::http::{create_router, HttpTransport, SharedCore};
 
-fn parse_args() -> (u64, u16, String, HashMap<u64, String>) {
+fn parse_args() -> (u64, u16, String, HashMap<u64, String>, u64) {
     let args: Vec<String> = env::args().collect();
 
     let mut id: Option<u64> = None;
     let mut port: Option<u16> = None;
     let mut data_dir: Option<String> = None;
     let mut peers: HashMap<u64, String> = HashMap::new();
+    let mut snapshot_threshold: u64 = 1000; // Default
 
     let mut i = 1;
     while i < args.len() {
@@ -64,6 +68,10 @@ fn parse_args() -> (u64, u16, String, HashMap<u64, String>) {
                 }
                 i += 2;
             }
+            "--snapshot-threshold" => {
+                snapshot_threshold = args[i + 1].parse().expect("Invalid snapshot threshold");
+                i += 2;
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 i += 1;
@@ -75,16 +83,17 @@ fn parse_args() -> (u64, u16, String, HashMap<u64, String>) {
     let port = port.expect("--port is required");
     let data_dir = data_dir.expect("--data-dir is required");
 
-    (id, port, data_dir, peers)
+    (id, port, data_dir, peers, snapshot_threshold)
 }
 
 #[tokio::main]
 async fn main() {
-    let (id, port, data_dir, peers) = parse_args();
+    let (id, port, data_dir, peers, snapshot_threshold) = parse_args();
 
     println!("[NODE {}] Starting on port {}", id, port);
     println!("[NODE {}] Data directory: {}", id, data_dir);
     println!("[NODE {}] Peers: {:?}", id, peers);
+    println!("[NODE {}] Snapshot threshold: {} entries", id, snapshot_threshold);
 
     // Create storage
     let storage = FileStorage::new(&data_dir).expect("Failed to create storage");
@@ -97,12 +106,15 @@ async fn main() {
     let transport = HttpTransport::new(peers, Duration::from_secs(5));
 
     // Create RaftCore
-    let core = RaftCore::new(
+    let mut core = RaftCore::new(
         id,
         peer_ids,
         Box::new(storage),
         Box::new(kv_store.clone()),
     );
+
+    // Configure snapshot threshold
+    core.set_snapshot_threshold(snapshot_threshold);
 
     // Create RaftServer
     let (server, shared_core) = RaftServer::new(core, transport);

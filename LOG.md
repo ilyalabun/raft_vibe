@@ -429,9 +429,113 @@ Moved all files to appropriate subdirectories and updated imports throughout. Tr
 
 ---
 
+## Day 12: Log Compaction / Snapshotting
+
+**Prompt:** "let's implement log compaction via snapshotting"
+
+**Designing the Snapshot System**
+
+Implemented log compaction via snapshotting as described in Raft paper Section 7. Created a plan covering the full implementation: snapshot types, state machine serialization, storage persistence, transport RPC, and leader-to-follower snapshot transfer.
+
+**Snapshot Types**
+
+Created `src/core/snapshot.rs` with `SnapshotMetadata` (last_included_index, last_included_term) and `Snapshot` (metadata + serialized state machine data). Added `InstallSnapshotArgs` and `InstallSnapshotResult` RPC types to `raft_core.rs`.
+
+**Snapshotable State Machine**
+
+Extended `StateMachine` trait with `snapshot()` and `restore()` methods. Implemented for `KeyValueStore` using serde_json serialization. The snapshot captures the entire KV store state which can be restored on a follower.
+
+**Storage Layer Updates**
+
+Added `load_snapshot()` and `save_snapshot()` methods to the `Storage` trait. Implemented in both `MemoryStorage` (in-memory) and `FileStorage` (separate `snapshot` file with CRC32 checksum like other persisted state).
+
+**Transport Layer Updates**
+
+Added `install_snapshot()` method to the `Transport` trait. Implemented in both `InMemoryTransport` (channel-based) and `HttpTransport` (new `/raft/install_snapshot` endpoint).
+
+**RaftCore Snapshot Integration**
+
+Added `snapshot_last_index` and `snapshot_last_term` fields to track the last entry included in the most recent snapshot. Updated `last_log_index()` and `last_log_term()` to use snapshot values when the log is empty. Added helper `get_log_entry(index)` that accounts for snapshot offset when accessing log entries. Implemented `take_snapshot()` to serialize state machine, save to storage, and compact the log. Implemented `handle_install_snapshot()` to restore state machine from leader's snapshot.
+
+**Leader Snapshot Replication**
+
+Updated `send_heartbeat()` in `RaftNode` to detect when a follower is too far behind (next_index <= snapshot_last_index) and send `InstallSnapshot` instead of `AppendEntries`. After successful snapshot installation, updates `next_index` and `match_index` for the peer.
+
+**Automatic Snapshot Triggering**
+
+Added `snapshot_threshold` to `RaftConfig` (default 1000 entries). Modified `apply_committed_entries()` to automatically trigger a snapshot when `last_applied - snapshot_last_index > threshold`. Can be disabled by setting threshold to 0.
+
+**Recovery on Startup**
+
+Updated `RaftCore::new()` to load any existing snapshot from storage and restore the state machine before applying any remaining log entries. This ensures state is fully recovered after a restart.
+
+**Prompt:** "log file itself is not compacted" and "compaction is not triggered the second time"
+
+**Fixing Log Compaction Bugs**
+
+Discovered two bugs in the log compaction implementation. First, `truncate_log()` had inverted filter logic - it was keeping entries with `index < from_index` instead of `index >= from_index`. Second, there was a fundamental semantic confusion: log truncation for conflict resolution (keep older entries) vs. log compaction for snapshotting (keep newer entries) are opposite operations. Split into two distinct methods: `truncate_log()` removes entries >= index (for conflict resolution) and `compact_log()` removes entries < index (for snapshotting).
+
+**Prompt:** "now replication is cycling"
+
+**Fixing Replication After Snapshot**
+
+After compaction, replication was stuck in an infinite loop. Root cause: `apply_entries()` used direct Vec indexing `(entry.index - 1)` without accounting for the snapshot offset. After snapshot at index S, `log[0]` contains entry S+1, so the correct formula is `(entry.index - snapshot_last_index - 1)`.
+
+**Prompt:** "entries still not committing after snapshot"
+
+**Fixing handle_append_entries_result**
+
+Found another place using direct Vec indexing: `handle_append_entries_result()` used `self.log.get((entry_index - 1) as usize)` instead of the helper `get_log_entry()` that accounts for snapshot offset.
+
+**Prompt:** "Failed handle_append_entries: 0 1" (prev_log_term=0 instead of 1)
+
+**The Root Cause: replicate_to_peers**
+
+After extensive debugging with logging on both sender and receiver sides, discovered the real cluster was failing but tests passed. The difference: tests use `send_heartbeat()` which was fixed, but real client requests use `replicate_to_peers()` which had the same direct Vec indexing bug. When `prev_log_index == snapshot_last_index`, we must use `snapshot_last_term` instead of trying to look up the entry in the now-empty log.
+
+**Prompt:** "why tests didn't catch this bug?" and "let's write a test that catches this"
+
+**Test Coverage Gap**
+
+Explained why tests didn't catch the `replicate_to_peers()` bug: tests used `send_heartbeat()` for replication whereas the real cluster uses `replicate_to_peers()` for client commands. Added `test_replicate_to_peers_after_snapshot` that explicitly takes a snapshot and then calls `replicate_to_peers()` to verify correct `prev_log_term` calculation. The test was verified to catch the bug by temporarily reverting the fix.
+
+All 173 tests now pass, including the new regression test.
+
+**Fixing Log Compaction Bugs**
+
+Discovered two bugs in the log compaction implementation. First, `truncate_log()` had inverted filter logic - it was keeping entries with `index < from_index` instead of `index >= from_index`. Second, there was a fundamental semantic confusion: log truncation for conflict resolution (keep older entries) vs. log compaction for snapshotting (keep newer entries) are opposite operations. Split into two distinct methods: `truncate_log()` removes entries >= index (for conflict resolution) and `compact_log()` removes entries < index (for snapshotting).
+
+**Prompt:** "now replication is cycling"
+
+**Fixing Replication After Snapshot**
+
+After compaction, replication was stuck in an infinite loop. Root cause: `apply_entries()` used direct Vec indexing `(entry.index - 1)` without accounting for the snapshot offset. After snapshot at index S, `log[0]` contains entry S+1, so the correct formula is `(entry.index - snapshot_last_index - 1)`.
+
+**Prompt:** "entries still not committing after snapshot"
+
+**Fixing handle_append_entries_result**
+
+Found another place using direct Vec indexing: `handle_append_entries_result()` used `self.log.get((entry_index - 1) as usize)` instead of the helper `get_log_entry()` that accounts for snapshot offset.
+
+**Prompt:** "Failed handle_append_entries: 0 1" (prev_log_term=0 instead of 1)
+
+**The Root Cause: replicate_to_peers**
+
+After extensive debugging with logging on both sender and receiver sides, discovered the real cluster was failing but tests passed. The difference: tests use `send_heartbeat()` which was fixed, but real client requests use `replicate_to_peers()` which had the same direct Vec indexing bug. When `prev_log_index == snapshot_last_index`, we must use `snapshot_last_term` instead of trying to look up the entry in the now-empty log.
+
+**Prompt:** "why tests didn't catch this bug?" and "let's write a test that catches this"
+
+**Test Coverage Gap**
+
+Explained why tests didn't catch the `replicate_to_peers()` bug: tests used `send_heartbeat()` for replication whereas the real cluster uses `replicate_to_peers()` for client commands. Added `test_replicate_to_peers_after_snapshot` that explicitly takes a snapshot and then calls `replicate_to_peers()` to verify correct `prev_log_term` calculation. The test was verified to catch the bug by temporarily reverting the fix.
+
+All 173 tests now pass, including the new regression test.
+
+---
+
 ## Next Up
 
-- Potential future work: Log compaction/snapshotting, dynamic cluster membership
+- Potential future work: Dynamic cluster membership, cluster configuration changes
 
 ---
 

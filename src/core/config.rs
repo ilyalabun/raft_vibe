@@ -11,6 +11,9 @@ pub struct RaftConfig {
     pub election_timeout_min: Duration,
     /// Maximum election timeout (default: 500ms)
     pub election_timeout_max: Duration,
+    /// Number of applied log entries before triggering automatic snapshot (default: 1000)
+    /// Set to 0 to disable automatic snapshots
+    pub snapshot_threshold: u64,
 }
 
 impl Default for RaftConfig {
@@ -19,6 +22,7 @@ impl Default for RaftConfig {
             heartbeat_interval: Duration::from_millis(150),
             election_timeout_min: Duration::from_millis(300),
             election_timeout_max: Duration::from_millis(500),
+            snapshot_threshold: 1000,
         }
     }
 }
@@ -34,6 +38,13 @@ impl RaftConfig {
     pub fn with_election_timeout(mut self, min: Duration, max: Duration) -> Self {
         self.election_timeout_min = min;
         self.election_timeout_max = max;
+        self
+    }
+
+    /// Create a new config with custom snapshot threshold
+    /// Set to 0 to disable automatic snapshots
+    pub fn with_snapshot_threshold(mut self, threshold: u64) -> Self {
+        self.snapshot_threshold = threshold;
         self
     }
 
