@@ -600,6 +600,8 @@ impl RaftCore {
     pub fn become_leader(&mut self) {
         self.state = RaftState::Leader;
         self.current_leader = Some(self.id);
+        // Reset heartbeat timer to prevent election timeout from firing on leader
+        self.last_heartbeat = Instant::now();
         println!("[NODE {}] Became LEADER for term {}", self.id, self.current_term);
 
         // Reinitialize next_index and match_index BEFORE appending no-op

@@ -2,7 +2,7 @@
 
 use std::pin::pin;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{interval, sleep_until, Duration, Instant};
+use tokio::time::{interval, sleep_until, Duration, Instant, MissedTickBehavior};
 
 use super::config::RaftConfig;
 use super::raft_node::{RaftNode, SharedCore};
@@ -35,6 +35,7 @@ enum Command {
 #[derive(Clone)]
 pub struct RaftHandle {
     command_tx: mpsc::Sender<Command>,
+    shutdown_tx: mpsc::Sender<()>,
 }
 
 impl RaftHandle {
@@ -52,6 +53,11 @@ impl RaftHandle {
 
         reply_rx.await.map_err(|_| RaftError::NotLeader { leader_hint: None })?
     }
+
+    /// Shutdown the RaftServer gracefully
+    pub async fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(()).await;
+    }
 }
 
 /// Raft server that handles client commands and coordinates with RaftNode
@@ -59,6 +65,8 @@ pub struct RaftServer<T: Transport> {
     node: RaftNode<T>,
     command_rx: mpsc::Receiver<Command>,
     command_tx: mpsc::Sender<Command>,
+    shutdown_rx: mpsc::Receiver<()>,
+    shutdown_tx: mpsc::Sender<()>,
     config: RaftConfig,
 }
 
@@ -73,12 +81,15 @@ impl<T: Transport + 'static> RaftServer<T> {
     /// Returns the server and shared core for RPC handling
     pub fn with_config(core: RaftCore, transport: T, config: RaftConfig) -> (Self, SharedCore) {
         let (command_tx, command_rx) = mpsc::channel(32);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let node = RaftNode::new(core, transport);
         let shared_core = node.shared_core();
         let server = Self {
             node,
             command_rx,
             command_tx,
+            shutdown_rx,
+            shutdown_tx,
             config,
         };
         (server, shared_core)
@@ -88,6 +99,7 @@ impl<T: Transport + 'static> RaftServer<T> {
     pub fn start(self) -> RaftHandle {
         let handle = RaftHandle {
             command_tx: self.command_tx.clone(),
+            shutdown_tx: self.shutdown_tx.clone(),
         };
 
         tokio::spawn(self.run());
@@ -98,6 +110,8 @@ impl<T: Transport + 'static> RaftServer<T> {
     /// Main server loop
     async fn run(mut self) {
         let mut heartbeat_interval = interval(self.config.heartbeat_interval);
+        // Use Delay behavior to prevent accumulated missed ticks from starving election timeout
+        heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         // Use a fixed election timeout duration for this server instance
         let election_timeout = self.config.random_election_timeout();
 
@@ -107,6 +121,10 @@ impl<T: Transport + 'static> RaftServer<T> {
             let election_sleep = pin!(sleep_until(election_deadline));
 
             tokio::select! {
+                // Handle shutdown signal
+                _ = self.shutdown_rx.recv() => {
+                    break;
+                }
                 // Handle client commands
                 Some(cmd) = self.command_rx.recv() => {
                     match cmd {
@@ -119,6 +137,8 @@ impl<T: Transport + 'static> RaftServer<T> {
                 // Send heartbeats if leader
                 _ = heartbeat_interval.tick() => {
                     if self.node.state().await == RaftState::Leader {
+                        // Update our own heartbeat timer to prevent election timeout
+                        self.node.shared_core().lock().await.last_heartbeat = Instant::now();
                         self.node.send_heartbeat().await;
                     }
                 }

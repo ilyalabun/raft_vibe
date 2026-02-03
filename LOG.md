@@ -533,6 +533,67 @@ All 173 tests now pass, including the new regression test.
 
 ---
 
+## Day 13: HTTP Cluster Integration Tests
+
+**Prompt:** "Implement the following plan: Real HTTP Concurrency Tests"
+
+**Creating Integration Test Infrastructure**
+
+Created a new integration test file `tests/http_cluster.rs` for testing actual HTTP servers in a 3-node cluster configuration. Built a `TestCluster` struct that manages node lifecycle including startup, shutdown, and leader discovery. Each `TestNode` holds an HTTP server address, a shutdown channel for graceful HTTP termination, and a `RaftHandle` for RaftServer shutdown.
+
+**Test Cases Implemented**
+
+Implemented 8 comprehensive integration tests:
+1. `test_cluster_elects_leader` - Verifies exactly one leader is elected
+2. `test_concurrent_client_commands` - 20 concurrent writes verify correct replication
+3. `test_rapid_fire_http_requests` - 100 rapid-fire commands stress test
+4. `test_concurrent_reads_and_writes` - Mixed read/write operations
+5. `test_follower_redirect` - Verifies proper error with leader_hint when submitting to follower
+6. `test_leader_failover` - Verifies new leader election after killing the current leader
+7. `test_concurrent_commands_during_leader_failover` - Commands continue working through failover
+8. `test_cluster_consistency` - All nodes have identical state after operations
+
+**Bug Fixes Discovered During Testing**
+
+**1. Election Timeout Not Firing**
+After killing a leader, followers never started elections. Diagnosed the issue: the leader's RaftServer was still running and sending heartbeats to followers even though its HTTP server was stopped. Added a `shutdown()` method to `RaftHandle` that sends a shutdown signal to the RaftServer loop, ensuring both HTTP and Raft servers stop together.
+
+**2. MissedTickBehavior Causing Starvation**
+Initially suspected `tokio::time::Interval`'s default `MissedTickBehavior::Burst` was starving the election timeout branch, but this wasn't the root cause. Added `set_missed_tick_behavior(MissedTickBehavior::Delay)` anyway for correctness.
+
+**3. Leader Election Timeout Busy Loop**
+After a node became leader, its election timeout kept firing (deadline was always in the past) causing a busy loop. Fixed by updating `last_heartbeat` when: (a) a node becomes leader via `become_leader()`, and (b) the leader sends heartbeats in the RaftServer loop.
+
+**Architecture Improvements**
+
+- Added `shutdown()` method to `RaftHandle` for graceful RaftServer termination
+- Added shutdown channel (`mpsc`) to `RaftServer` struct with corresponding select! branch
+- Updated `become_leader()` to reset `last_heartbeat` to prevent election timeout on leaders
+- RaftServer now updates `last_heartbeat` when sending heartbeats as leader
+
+All 181 tests pass (173 unit tests + 8 integration tests).
+
+**Prompt:** "I want one more integration/concurrency test. big number of concurrent write requests for one key in kv state machine with different values. verify that all cluster nodes have the same state machine state which is the last command from the log and also logs are consistent across cluster"
+
+**Concurrent Writes to Same Key Test**
+
+Added a 9th integration test `test_concurrent_writes_to_same_key` that tests Raft's linearizability guarantees. The test submits 50 concurrent writes to the same key (`contested_key`) with different values (`writer_0` through `writer_49`). All writes are sent simultaneously to the leader.
+
+Key verifications:
+1. All 50 writes succeed (Raft serializes concurrent commands)
+2. For each node, the state machine value for `contested_key` matches the value from the last log entry
+3. All nodes have identical logs (same entries in same order)
+4. All state machines have identical state across the cluster
+5. Log length is exactly 51 (1 NOOP + 50 writes)
+
+This test validates that even under high concurrent write contention to the same key, Raft maintains consistency: the final state is determined by the order in which commands were serialized into the log.
+
+Added `shared_core: SharedCore` field to `TestNode` to enable direct log inspection without introducing new HTTP endpoints.
+
+All 182 tests pass (173 unit tests + 9 integration tests).
+
+---
+
 ## Next Up
 
 - Potential future work: Dynamic cluster membership, cluster configuration changes
