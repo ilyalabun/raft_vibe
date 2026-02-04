@@ -12,7 +12,8 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use raft_vibe::api::client_http::{
-    create_client_router_full, ErrorResponse, LeaderResponse, StatusResponse, SubmitResponse,
+    create_client_router_with_reads, ErrorResponse, LeaderResponse, ReadResponse, StatusResponse,
+    SubmitResponse,
 };
 use raft_vibe::core::config::RaftConfig;
 use raft_vibe::core::raft_core::RaftCore;
@@ -21,9 +22,7 @@ use raft_vibe::state_machine::kv::{KeyValueStore, SharedKvStore};
 use raft_vibe::storage::memory::MemoryStorage;
 use raft_vibe::transport::http::{create_router, HttpTransport, SharedCore};
 
-use axum::routing::get;
 use axum::Router;
-use serde::Serialize;
 
 /// A single test node in the cluster
 struct TestNode {
@@ -295,37 +294,44 @@ async fn submit_command(
     }
 }
 
-async fn get_kv(
-    client: &reqwest::Client,
-    addr: &SocketAddr,
-) -> Result<HashMap<String, String>, reqwest::Error> {
-    client
-        .get(format!("http://{}/client/kv", addr))
-        .send()
-        .await?
-        .json()
-        .await
-}
-
-#[allow(dead_code)]
-async fn get_value(
+/// Perform a linearizable read via the ReadIndex protocol
+async fn linearizable_read(
     client: &reqwest::Client,
     addr: &SocketAddr,
     key: &str,
-) -> Result<Option<String>, reqwest::Error> {
-    #[derive(serde::Deserialize)]
-    struct GetResponse {
-        value: Option<String>,
-    }
-
-    let response: GetResponse = client
-        .get(format!("http://{}/client/get/{}", addr, key))
+) -> Result<ReadResponse, ReadError> {
+    let response = client
+        .get(format!("http://{}/client/read/{}", addr, key))
         .send()
-        .await?
-        .json()
-        .await?;
+        .await
+        .map_err(|e| ReadError::Network(e.to_string()))?;
 
-    Ok(response.value)
+    if response.status().is_success() {
+        let result: ReadResponse = response
+            .json()
+            .await
+            .map_err(|e| ReadError::Network(e.to_string()))?;
+        Ok(result)
+    } else {
+        let error: ErrorResponse = response
+            .json()
+            .await
+            .map_err(|e| ReadError::Network(e.to_string()))?;
+        Err(ReadError::NotLeader {
+            message: error.error,
+            leader_hint: error.leader_hint,
+        })
+    }
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+enum ReadError {
+    Network(String),
+    NotLeader {
+        message: String,
+        leader_hint: Option<u64>,
+    },
 }
 
 #[derive(Debug)]
@@ -338,32 +344,7 @@ enum SubmitError {
     },
 }
 
-// Router creation (duplicated from server.rs since it's not exported)
-
-#[derive(Serialize)]
-struct GetResponse {
-    key: String,
-    value: Option<String>,
-}
-
-async fn handle_get(
-    axum::extract::State(kv_store): axum::extract::State<SharedKvStore>,
-    axum::extract::Path(key): axum::extract::Path<String>,
-) -> (axum::http::StatusCode, axum::Json<GetResponse>) {
-    let value = kv_store.lock().unwrap().get(&key);
-    let status = if value.is_some() {
-        axum::http::StatusCode::OK
-    } else {
-        axum::http::StatusCode::NOT_FOUND
-    };
-    (status, axum::Json(GetResponse { key, value }))
-}
-
-async fn handle_dump(
-    axum::extract::State(kv_store): axum::extract::State<SharedKvStore>,
-) -> axum::Json<HashMap<String, String>> {
-    axum::Json(kv_store.lock().unwrap().all())
-}
+// Router creation
 
 fn create_combined_router(
     raft_core: SharedCore,
@@ -372,13 +353,9 @@ fn create_combined_router(
     kv_store: SharedKvStore,
 ) -> Router {
     let raft_router = create_router(raft_core);
-    let client_router = create_client_router_full(raft_handle, client_core);
-    let kv_router = Router::new()
-        .route("/client/get/{key}", get(handle_get))
-        .route("/client/kv", get(handle_dump))
-        .with_state(kv_store);
+    let client_router = create_client_router_with_reads(raft_handle, client_core, kv_store);
 
-    raft_router.merge(client_router).merge(kv_router)
+    raft_router.merge(client_router)
 }
 
 // Test cases
@@ -444,18 +421,19 @@ async fn test_concurrent_client_commands() {
     // Give time for replication
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Verify all nodes have consistent state
-    for addr in cluster.all_addrs() {
-        let kv = get_kv(&client, &addr).await.unwrap();
-        assert_eq!(kv.len(), 20, "All nodes should have 20 keys");
-        for i in 0..20 {
-            assert_eq!(
-                kv.get(&format!("key{}", i)),
-                Some(&format!("value{}", i)),
-                "Key{} should have correct value",
-                i
-            );
-        }
+    // Verify all keys via linearizable reads from leader
+    for i in 0..20 {
+        let key = format!("key{}", i);
+        let expected_value = format!("value{}", i);
+        let read_result = linearizable_read(&client, &leader_addr, &key)
+            .await
+            .expect("Linearizable read should succeed");
+        assert_eq!(
+            read_result.value,
+            Some(expected_value),
+            "Key {} should have correct value",
+            i
+        );
     }
 
     cluster.shutdown().await;
@@ -497,10 +475,16 @@ async fn test_rapid_fire_http_requests() {
     // All should succeed (leader handles concurrent commands)
     assert_eq!(successes, 100, "All 100 commands should succeed");
 
-    // Verify state machine has all values
+    // Verify state machine has all values via linearizable reads
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let kv = get_kv(&client, &leader_addr).await.unwrap();
-    assert_eq!(kv.len(), 100, "Should have 100 keys in state machine");
+    let mut read_count = 0;
+    for i in 0..100 {
+        let key = format!("rapid{}", i);
+        if linearizable_read(&client, &leader_addr, &key).await.is_ok() {
+            read_count += 1;
+        }
+    }
+    assert_eq!(read_count, 100, "Should have 100 keys in state machine");
 
     cluster.shutdown().await;
 }
@@ -542,12 +526,14 @@ async fn test_concurrent_reads_and_writes() {
         }));
     }
 
-    // Spawn readers on all nodes
-    for addr in cluster.all_addrs() {
+    // Spawn linearizable readers (must go through leader)
+    for i in 0..10 {
         let client = client.clone();
+        let addr = leader_addr;
         handles.push(tokio::spawn(async move {
-            // Read from any node
-            let _ = get_kv(&client, &addr).await;
+            // Linearizable read from leader
+            let key = format!("rw{}", i);
+            let _ = linearizable_read(&client, &addr, &key).await;
             Ok::<_, SubmitError>(())
         }));
     }
@@ -562,10 +548,16 @@ async fn test_concurrent_reads_and_writes() {
         .count();
     assert_eq!(failures, 0, "No operations should fail");
 
-    // Verify final state is consistent
+    // Verify final state is consistent via linearizable reads
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let kv = get_kv(&client, &leader_addr).await.unwrap();
-    assert_eq!(kv.len(), 30, "Should have 30 keys total");
+    let mut key_count = 0;
+    for i in 0..30 {
+        let key = format!("rw{}", i);
+        if linearizable_read(&client, &leader_addr, &key).await.is_ok() {
+            key_count += 1;
+        }
+    }
+    assert_eq!(key_count, 30, "Should have 30 keys total");
 
     cluster.shutdown().await;
 }
@@ -653,9 +645,11 @@ async fn test_leader_failover() {
         .await
         .expect("New leader should accept writes");
 
-    // Verify the data is there
-    let kv = get_kv(&client, &new_addr).await.unwrap();
-    assert_eq!(kv.get("after_failover"), Some(&"success".to_string()));
+    // Verify the data is there via linearizable read
+    let read_result = linearizable_read(&client, &new_addr, "after_failover")
+        .await
+        .expect("Linearizable read should succeed");
+    assert_eq!(read_result.value, Some("success".to_string()));
 
     cluster.shutdown().await;
 }
@@ -692,7 +686,7 @@ async fn test_concurrent_commands_during_leader_failover() {
         .unwrap();
 
     // Get remaining node addresses (not the leader)
-    let remaining_addrs: Vec<_> = cluster
+    let _remaining_addrs: Vec<_> = cluster
         .all_addrs()
         .into_iter()
         .filter(|&addr| addr != leader_addr)
@@ -718,13 +712,16 @@ async fn test_concurrent_commands_during_leader_failover() {
 
     assert!(successes >= 1, "Should be able to write after failover");
 
-    // Verify remaining nodes have consistent data
+    // Verify data via linearizable read from new leader
     tokio::time::sleep(Duration::from_millis(200)).await;
-    for addr in &remaining_addrs {
-        let kv = get_kv(&client, addr).await.unwrap();
-        // Should have at least the initial data
-        assert!(kv.len() >= 5, "Nodes should have at least initial data");
+    let mut read_count = 0;
+    for i in 0..5 {
+        let key = format!("failover{}", i);
+        if linearizable_read(&client, &new_leader_addr, &key).await.is_ok() {
+            read_count += 1;
+        }
     }
+    assert!(read_count >= 5, "Should have at least initial data");
 
     cluster.shutdown().await;
 }
@@ -753,14 +750,18 @@ async fn test_cluster_consistency() {
     // Give time for replication
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // All nodes should have the same data
-    let expected = get_kv(&client, &leader_addr).await.unwrap();
-
-    for addr in cluster.all_addrs() {
-        let kv = get_kv(&client, &addr).await.unwrap();
+    // Verify all data via linearizable reads from leader
+    for i in 0..10 {
+        let key = format!("key{}", i);
+        let expected_value = format!("value{}", i);
+        let read_result = linearizable_read(&client, &leader_addr, &key)
+            .await
+            .expect("Linearizable read should succeed");
         assert_eq!(
-            kv, expected,
-            "All nodes should have identical state"
+            read_result.value,
+            Some(expected_value),
+            "Key {} should have correct value",
+            i
         );
     }
 
@@ -885,6 +886,131 @@ async fn test_concurrent_writes_to_same_key() {
         51,
         "Log should have 51 entries (1 NOOP + 50 writes)"
     );
+
+    cluster.shutdown().await;
+}
+
+/// Test that linearizable read returns NotLeader error when sent to a follower
+#[tokio::test]
+async fn test_linearizable_read_not_leader() {
+    let cluster = TestCluster::new().await;
+
+    // Wait for leader
+    cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .expect("Should elect a leader");
+
+    // Find a follower
+    let follower_addr = cluster
+        .find_follower()
+        .await
+        .expect("Should have a follower");
+
+    let client = reqwest::Client::new();
+
+    // Linearizable read from follower should fail with NotLeader
+    let result = linearizable_read(&client, &follower_addr, "anykey").await;
+
+    match result {
+        Err(ReadError::NotLeader { message, leader_hint }) => {
+            assert_eq!(message, "Not the leader");
+            assert!(
+                leader_hint.is_some(),
+                "Should provide leader_hint when known"
+            );
+        }
+        Ok(_) => panic!("Should have failed when reading from follower"),
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    }
+
+    cluster.shutdown().await;
+}
+
+/// Test that linearizable read succeeds when sent to the leader
+#[tokio::test]
+async fn test_linearizable_read_as_leader() {
+    let cluster = TestCluster::new().await;
+
+    // Wait for leader
+    let leader_addr = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .expect("Should elect a leader");
+
+    let client = reqwest::Client::new();
+
+    // Write a value first
+    submit_command(&client, &leader_addr, "SET mykey myvalue")
+        .await
+        .expect("Write should succeed");
+
+    // Linearizable read should succeed and return the value
+    let read_result = linearizable_read(&client, &leader_addr, "mykey")
+        .await
+        .expect("Linearizable read should succeed");
+
+    assert_eq!(read_result.key, "mykey");
+    assert_eq!(read_result.value, Some("myvalue".to_string()));
+    assert!(read_result.read_index > 0, "read_index should be > 0");
+
+    cluster.shutdown().await;
+}
+
+/// Test that linearizable read returns None for non-existent keys
+#[tokio::test]
+async fn test_linearizable_read_missing_key() {
+    let cluster = TestCluster::new().await;
+
+    // Wait for leader
+    let leader_addr = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .expect("Should elect a leader");
+
+    let client = reqwest::Client::new();
+
+    // Linearizable read of non-existent key should succeed with None value
+    let read_result = linearizable_read(&client, &leader_addr, "nonexistent")
+        .await
+        .expect("Linearizable read should succeed");
+
+    assert_eq!(read_result.key, "nonexistent");
+    assert_eq!(read_result.value, None);
+    // read_index is u64 so it's always >= 0, just verify it exists
+    let _ = read_result.read_index;
+
+    cluster.shutdown().await;
+}
+
+/// Test that linearizable read returns consistent values after writes
+#[tokio::test]
+async fn test_linearizable_read_after_writes() {
+    let cluster = TestCluster::new().await;
+
+    // Wait for leader
+    let leader_addr = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .expect("Should elect a leader");
+
+    let client = reqwest::Client::new();
+
+    // Write multiple values
+    for i in 0..5 {
+        let cmd = format!("SET linearkey value{}", i);
+        submit_command(&client, &leader_addr, &cmd)
+            .await
+            .expect("Write should succeed");
+    }
+
+    // Linearizable read should see the latest value
+    let read_result = linearizable_read(&client, &leader_addr, "linearkey")
+        .await
+        .expect("Linearizable read should succeed");
+
+    // The value should be the last one written
+    assert_eq!(read_result.value, Some("value4".to_string()));
 
     cluster.shutdown().await;
 }

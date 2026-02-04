@@ -2,6 +2,7 @@
 //!
 //! Provides HTTP endpoints for external clients to interact with the Raft cluster:
 //! - Submit commands to the leader
+//! - Linearizable reads via ReadIndex
 //! - Query cluster status and leader information
 
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use tokio::sync::Mutex;
 
 use crate::core::raft_core::{RaftCore, RaftState};
 use crate::core::raft_server::{RaftError, RaftHandle};
+use crate::state_machine::kv::SharedKvStore;
 
 /// Shared state for the client HTTP server
 pub type SharedCore = Arc<Mutex<RaftCore>>;
@@ -84,6 +86,28 @@ pub struct StatusResponse {
     pub log_length: u64,
 }
 
+/// Response from a linearizable read
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadResponse {
+    /// The key that was read
+    pub key: String,
+    /// The value (None if key doesn't exist)
+    pub value: Option<String>,
+    /// The read index used for linearizability
+    pub read_index: u64,
+}
+
+/// State for client HTTP handlers with KV store access for linearizable reads
+#[derive(Clone)]
+pub struct ClientStateWithKv {
+    /// Handle for submitting commands and read_index
+    pub handle: RaftHandle,
+    /// Shared core for reading status/leader info
+    pub core: SharedCore,
+    /// Shared KV store for linearizable reads
+    pub kv_store: SharedKvStore,
+}
+
 /// Create an axum router for client HTTP API (simplified, core-only version for testing)
 pub fn create_client_router(core: SharedCore) -> Router {
     Router::new()
@@ -99,6 +123,25 @@ pub fn create_client_router_full(handle: RaftHandle, core: SharedCore) -> Router
         .route("/client/submit", post(handle_submit))
         .route("/client/leader", get(handle_leader))
         .route("/client/status", get(handle_status))
+        .with_state(state)
+}
+
+/// Create an axum router for client HTTP API with linearizable reads
+pub fn create_client_router_with_reads(
+    handle: RaftHandle,
+    core: SharedCore,
+    kv_store: SharedKvStore,
+) -> Router {
+    let state = ClientStateWithKv {
+        handle,
+        core,
+        kv_store,
+    };
+    Router::new()
+        .route("/client/submit", post(handle_submit_kv))
+        .route("/client/read/:key", get(handle_linearizable_read))
+        .route("/client/leader", get(handle_leader_kv))
+        .route("/client/status", get(handle_status_kv))
         .with_state(state)
 }
 
@@ -138,7 +181,130 @@ pub async fn handle_submit(
                 leader_hint: None,
             }),
         )),
+        Err(RaftError::ReadTimeout) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Read timeout".to_string(),
+                leader_hint: None,
+            }),
+        )),
     }
+}
+
+/// Handle POST /client/submit - submit a command (with KV store state)
+async fn handle_submit_kv(
+    State(state): State<ClientStateWithKv>,
+    Json(request): Json<SubmitRequest>,
+) -> Result<Json<SubmitResponse>, (StatusCode, Json<ErrorResponse>)> {
+    match state.handle.submit(request.command).await {
+        Ok(result) => Ok(Json(SubmitResponse { result })),
+        Err(RaftError::NotLeader { leader_hint }) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Not the leader".to_string(),
+                leader_hint,
+            }),
+        )),
+        Err(RaftError::NotCommitted) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Entry not committed (couldn't reach majority)".to_string(),
+                leader_hint: None,
+            }),
+        )),
+        Err(RaftError::StateMachine(err)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("State machine error: {}", err),
+                leader_hint: None,
+            }),
+        )),
+        Err(RaftError::Transport(_)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Transport error".to_string(),
+                leader_hint: None,
+            }),
+        )),
+        Err(RaftError::ReadTimeout) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Read timeout".to_string(),
+                leader_hint: None,
+            }),
+        )),
+    }
+}
+
+/// Handle GET /client/read/:key - linearizable read using ReadIndex
+pub async fn handle_linearizable_read(
+    State(state): State<ClientStateWithKv>,
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> Result<Json<ReadResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Step 1: Get read_index (confirms leadership with majority)
+    let read_index = match state.handle.read_index().await {
+        Ok(index) => index,
+        Err(RaftError::NotLeader { leader_hint }) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "Not the leader".to_string(),
+                    leader_hint,
+                }),
+            ));
+        }
+        Err(RaftError::ReadTimeout) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "Read timeout (leadership confirmation or apply timeout)".to_string(),
+                    leader_hint: None,
+                }),
+            ));
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Unexpected error: {:?}", e),
+                    leader_hint: None,
+                }),
+            ));
+        }
+    };
+
+    // Step 2: Read from state machine (we've confirmed we're up to date)
+    let value = state.kv_store.lock().unwrap().get(&key);
+
+    Ok(Json(ReadResponse {
+        key,
+        value,
+        read_index,
+    }))
+}
+
+/// Handle GET /client/leader - get current leader information (with KV store state)
+async fn handle_leader_kv(State(state): State<ClientStateWithKv>) -> Json<LeaderResponse> {
+    let core = state.core.lock().await;
+    Json(LeaderResponse {
+        leader_id: core.current_leader,
+        node_id: core.id,
+        is_leader: core.state == RaftState::Leader,
+    })
+}
+
+/// Handle GET /client/status - get node status (with KV store state)
+async fn handle_status_kv(State(state): State<ClientStateWithKv>) -> Json<StatusResponse> {
+    let core = state.core.lock().await;
+    Json(StatusResponse {
+        node_id: core.id,
+        state: format!("{:?}", core.state),
+        term: core.current_term,
+        leader_id: core.current_leader,
+        commit_index: core.commit_index,
+        last_applied: core.last_applied,
+        log_length: core.log.len() as u64,
+    })
 }
 
 /// Handle GET /client/leader - get current leader information (full integration)

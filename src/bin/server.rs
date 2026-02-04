@@ -18,15 +18,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    routing::get,
-    Json, Router,
-};
-use serde::Serialize;
+use axum::Router;
 
-use raft_vibe::api::client_http::create_client_router_full;
+use raft_vibe::api::client_http::create_client_router_with_reads;
 use raft_vibe::core::raft_core::RaftCore;
 use raft_vibe::core::raft_server::RaftServer;
 use raft_vibe::state_machine::kv::{KeyValueStore, SharedKvStore};
@@ -129,38 +123,13 @@ async fn main() {
     let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
     println!("[NODE {}] Listening on {}", id, addr);
     println!("[NODE {}] Client API:", id);
-    println!("[NODE {}]   POST /client/submit      - Submit a command", id);
-    println!("[NODE {}]   GET  /client/get/:key    - Get a value", id);
-    println!("[NODE {}]   GET  /client/kv          - Dump all key-values", id);
+    println!("[NODE {}]   POST /client/submit       - Submit a command", id);
+    println!("[NODE {}]   GET  /client/read/:key   - Linearizable read", id);
     println!("[NODE {}]   GET  /client/leader      - Get leader info", id);
     println!("[NODE {}]   GET  /client/status      - Get node status", id);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
-}
-
-/// Response for GET request
-#[derive(Serialize)]
-struct GetResponse {
-    key: String,
-    value: Option<String>,
-}
-
-/// Handle GET /client/get/:key
-async fn handle_get(
-    State(kv_store): State<SharedKvStore>,
-    Path(key): Path<String>,
-) -> (StatusCode, Json<GetResponse>) {
-    let value = kv_store.lock().unwrap().get(&key);
-    let status = if value.is_some() { StatusCode::OK } else { StatusCode::NOT_FOUND };
-    (status, Json(GetResponse { key, value }))
-}
-
-/// Handle GET /client/kv - dump entire state
-async fn handle_dump(
-    State(kv_store): State<SharedKvStore>,
-) -> Json<HashMap<String, String>> {
-    Json(kv_store.lock().unwrap().all())
 }
 
 /// Create a combined router with both Raft RPC and client API routes
@@ -173,15 +142,9 @@ fn create_combined_router(
     // Raft RPC routes (/raft/*)
     let raft_router = create_router(raft_core);
 
-    // Client API routes (/client/*)
-    let client_router = create_client_router_full(raft_handle, client_core);
-
-    // KV read endpoints
-    let kv_router = Router::new()
-        .route("/client/get/{key}", get(handle_get))
-        .route("/client/kv", get(handle_dump))
-        .with_state(kv_store);
+    // Client API routes (/client/*) with linearizable reads
+    let client_router = create_client_router_with_reads(raft_handle, client_core, kv_store);
 
     // Merge routers
-    raft_router.merge(client_router).merge(kv_router)
+    raft_router.merge(client_router)
 }

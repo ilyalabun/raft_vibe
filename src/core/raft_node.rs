@@ -162,8 +162,8 @@ impl<T: Transport> RaftNode<T> {
     /// Heartbeats in Raft are AppendEntries RPCs that also include any entries
     /// the follower might be missing (for catch-up). If a follower is too far
     /// behind (needs entries that have been compacted), sends InstallSnapshot instead.
-    /// Returns true if still leader.
-    pub async fn send_heartbeat(&self) -> bool {
+    /// Returns (still_leader, success_count) - whether still leader and how many peers responded successfully.
+    pub async fn send_heartbeat(&self) -> (bool, usize) {
         // Enum to hold different request types
         enum Request {
             AppendEntries(AppendEntriesArgs, u64), // args, last_entry_index
@@ -175,7 +175,7 @@ impl<T: Transport> RaftNode<T> {
 
             // Only leaders send heartbeats
             if core.state != RaftState::Leader {
-                return false;
+                return (false, 0);
             }
 
             let mut requests_to_send = Vec::new();
@@ -267,13 +267,15 @@ impl<T: Transport> RaftNode<T> {
 
         let results = futures::future::join_all(futures).await;
 
-        // Process results
+        // Process results and count successes
+        let mut success_count = 0;
         for (peer_id, result_type) in results {
             match result_type {
                 ResultType::AppendEntries(result, last_entry_index) => {
                     if let Ok(append_result) = result {
                         let mut core = self.core.lock().await;
                         let _ = core.handle_append_entries_result(peer_id, last_entry_index, &append_result);
+                        success_count += 1;
                     }
                 }
                 ResultType::InstallSnapshot(result, last_included_index) => {
@@ -285,6 +287,7 @@ impl<T: Transport> RaftNode<T> {
                                 let mut core = self.core.lock().await;
                                 core.next_index.insert(peer_id, last_included_index + 1);
                                 core.match_index.insert(peer_id, last_included_index);
+                                success_count += 1;
                             }
                             InstallSnapshotResult::Failed { term, reason: _ } => {
                                 // If peer has higher term, step down
@@ -301,8 +304,9 @@ impl<T: Transport> RaftNode<T> {
             }
         }
 
-        // Return whether we're still leader
-        self.core.lock().await.state == RaftState::Leader
+        // Return whether we're still leader and how many peers responded successfully
+        let still_leader = self.core.lock().await.state == RaftState::Leader;
+        (still_leader, success_count)
     }
 }
 
@@ -429,7 +433,7 @@ mod tests {
         assert_eq!(node1.state().await, RaftState::Leader);
 
         // Send heartbeat
-        let (still_leader, _, _) = tokio::join!(
+        let ((still_leader, _), _, _) = tokio::join!(
             node1.send_heartbeat(),
             handle2.process_one_shared(&shared2),
             handle3.process_one_shared(&shared3),
@@ -659,7 +663,7 @@ mod tests {
         assert_eq!(node1.state().await, RaftState::Leader);
 
         // Send heartbeat - node 3 doesn't respond (times out)
-        let (still_leader, _) = tokio::join!(
+        let ((still_leader, _), _) = tokio::join!(
             node1.send_heartbeat(),
             handle2.process_one_shared(&shared2),
             // handle3 not processed - times out

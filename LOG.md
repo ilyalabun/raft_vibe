@@ -594,6 +594,77 @@ All 182 tests pass (173 unit tests + 9 integration tests).
 
 ---
 
+## Day 13: ReadIndex Linearizable Reads
+
+**Prompt:** "Implement the ReadIndex algorithm for linearizable reads"
+
+**The Problem with Non-Linearizable Reads**
+
+Previously, reads bypassed Raft entirely - `GET /client/get/{key}` read directly from the `SharedKvStore`. This could return stale data from a partitioned leader that hasn't realized it's no longer the leader.
+
+**ReadIndex Algorithm Implementation**
+
+Implemented the ReadIndex algorithm for linearizable reads:
+1. Client sends read request to leader
+2. Leader records current `commit_index` as `read_index`
+3. Leader sends heartbeats to confirm it's still leader (majority must respond)
+4. Once confirmed, leader waits until `last_applied >= read_index`
+5. Leader reads from state machine and returns result
+
+**Changes Made**
+
+1. **RaftError::ReadTimeout** - New error variant for when leadership confirmation or apply times out
+
+2. **Command::ReadIndex** - New command variant in the server's command enum, allowing clients to request a read index
+
+3. **RaftHandle::read_index()** - Public method to request a linearizable read index
+
+4. **send_heartbeat() return type** - Changed from `-> bool` to `-> (bool, usize)` to return both whether still leader and how many peers responded successfully (needed for majority confirmation)
+
+5. **handle_read_index()** - Core implementation that:
+   - Checks if leader and gets `read_index = commit_index`
+   - Sends heartbeat to confirm leadership (requires majority response)
+   - Polls until `last_applied >= read_index` (with timeout)
+   - Returns the `last_applied` index
+
+6. **HTTP Endpoint** - Added `GET /client/read/:key` that:
+   - Calls `read_index()` to confirm leadership
+   - Reads from KV store after confirmation
+   - Returns `ReadResponse` with key, value, and read_index
+
+7. **Updated Tests** - Replaced non-linearizable `get_kv()` and `get_value()` helpers with `linearizable_read()` in integration tests
+
+**New Tests**
+
+- `test_linearizable_read_not_leader` - Returns NotLeader error when sent to follower
+- `test_linearizable_read_as_leader` - Succeeds after writing a value
+- `test_linearizable_read_missing_key` - Returns None for non-existent keys
+- `test_linearizable_read_after_writes` - Verifies reading latest value after multiple writes
+
+**Lower-Level Unit Tests (in raft_server.rs)**
+
+- `test_read_index_not_leader` - Returns NotLeader error when node is not leader
+- `test_read_index_as_leader` - Succeeds for leader with majority responding
+- `test_read_index_returns_last_applied` - Verifies returned index matches last_applied
+- `test_read_index_timeout_no_majority` - Returns ReadTimeout when peers don't respond
+- `test_read_index_leader_steps_down` - Returns NotLeader if discovers higher term during heartbeat
+- `test_read_index_with_pending_entries` - Verifies read_index waits for entries to be applied
+
+**API Changes**
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/client/submit` | POST | Write command (existing) |
+| `/client/read/:key` | GET | **Linearizable read (new)** |
+| `/client/leader` | GET | Get leader info (existing) |
+| `/client/status` | GET | Get node status (existing) |
+
+Removed the old non-linearizable endpoints (`/client/get/:key`, `/client/kv`).
+
+All 192 tests pass (179 unit tests + 13 integration tests).
+
+---
+
 ## Next Up
 
 - Potential future work: Dynamic cluster membership, cluster configuration changes

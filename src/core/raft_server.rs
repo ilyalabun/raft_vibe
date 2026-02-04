@@ -20,6 +20,8 @@ pub enum RaftError {
     StateMachine(String),
     /// Transport error occurred
     Transport(TransportError),
+    /// Leadership confirmation or apply timed out during read
+    ReadTimeout,
 }
 
 /// Command sent to the RaftServer from clients
@@ -28,6 +30,10 @@ enum Command {
     Submit {
         command: String,
         reply: oneshot::Sender<Result<String, RaftError>>,
+    },
+    /// Request a linearizable read index
+    ReadIndex {
+        reply: oneshot::Sender<Result<u64, RaftError>>,
     },
 }
 
@@ -57,6 +63,18 @@ impl RaftHandle {
     /// Shutdown the RaftServer gracefully
     pub async fn shutdown(&self) {
         let _ = self.shutdown_tx.send(()).await;
+    }
+
+    /// Request a linearizable read index
+    /// Returns the read_index after confirming leadership with a majority
+    pub async fn read_index(&self) -> Result<u64, RaftError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(Command::ReadIndex { reply: reply_tx })
+            .await
+            .map_err(|_| RaftError::NotLeader { leader_hint: None })?;
+
+        reply_rx.await.map_err(|_| RaftError::NotLeader { leader_hint: None })?
     }
 }
 
@@ -132,6 +150,10 @@ impl<T: Transport + 'static> RaftServer<T> {
                             let result = self.handle_submit(command).await;
                             let _ = reply.send(result);
                         }
+                        Command::ReadIndex { reply } => {
+                            let result = self.handle_read_index().await;
+                            let _ = reply.send(result);
+                        }
                     }
                 }
                 // Send heartbeats if leader
@@ -139,7 +161,7 @@ impl<T: Transport + 'static> RaftServer<T> {
                     if self.node.state().await == RaftState::Leader {
                         // Update our own heartbeat timer to prevent election timeout
                         self.node.shared_core().lock().await.last_heartbeat = Instant::now();
-                        self.node.send_heartbeat().await;
+                        let _ = self.node.send_heartbeat().await;
                     }
                 }
                 // Election timeout - start election if not leader
@@ -154,7 +176,7 @@ impl<T: Transport + 'static> RaftServer<T> {
 
                             if became_leader {
                                 // Immediately send heartbeat to establish leadership
-                                self.node.send_heartbeat().await;
+                                let _ = self.node.send_heartbeat().await;
                             }
                         }
                     }
@@ -200,6 +222,81 @@ impl<T: Transport + 'static> RaftServer<T> {
             Some(Ok(result)) => Ok(result),
             Some(Err(err)) => Err(RaftError::StateMachine(err)),
             None => Err(RaftError::NotCommitted),
+        }
+    }
+
+    /// Handle a ReadIndex request for linearizable reads
+    /// Returns the read_index after confirming leadership with a majority
+    async fn handle_read_index(&self) -> Result<u64, RaftError> {
+        let shared_core = self.node.shared_core();
+
+        // Step 1: Check if leader and get read_index = commit_index
+        let (read_index, num_peers) = {
+            let core = shared_core.lock().await;
+            if core.state != RaftState::Leader {
+                return Err(RaftError::NotLeader { leader_hint: core.current_leader });
+            }
+            (core.commit_index, core.peers.len())
+        };
+
+        // Step 2: Send heartbeat to confirm leadership (need majority to respond)
+        let (still_leader, success_count) = self.node.send_heartbeat().await;
+
+        if !still_leader {
+            let core = shared_core.lock().await;
+            return Err(RaftError::NotLeader { leader_hint: core.current_leader });
+        }
+
+        // Check if majority responded (self + peers that responded)
+        // For a cluster of N nodes, need (N/2 + 1) for majority
+        // We already count ourselves, so need success_count >= N/2
+        let total_nodes = num_peers + 1; // peers + self
+        let majority = total_nodes / 2 + 1;
+        let votes = success_count + 1; // successes + self
+
+        if votes < majority {
+            return Err(RaftError::ReadTimeout);
+        }
+
+        // Step 3: Wait until last_applied >= read_index (with timeout)
+        //
+        // Why wait? A linearizable read must see all writes committed before
+        // the read started. The state machine (last_applied) might lag behind
+        // commit_index if entries are applied asynchronously.
+        //
+        // In our implementation, entries are applied synchronously when committed
+        // (inside update_commit_index), so last_applied == commit_index on the
+        // leader and this wait completes immediately. However, we keep this check
+        // for correctness in case of:
+        // - Future async apply optimization
+        // - A new leader with unapplied committed entries
+        // - Any edge cases in commit/apply timing
+        let timeout = Duration::from_secs(5);
+        let start = Instant::now();
+        let poll_interval = Duration::from_millis(10);
+
+        loop {
+            {
+                let core = shared_core.lock().await;
+
+                // Check if still leader
+                if core.state != RaftState::Leader {
+                    return Err(RaftError::NotLeader { leader_hint: core.current_leader });
+                }
+
+                // Check if we've applied up to read_index
+                if core.last_applied >= read_index {
+                    return Ok(core.last_applied);
+                }
+            }
+
+            // Check timeout
+            if start.elapsed() >= timeout {
+                return Err(RaftError::ReadTimeout);
+            }
+
+            // Wait a bit before checking again
+            tokio::time::sleep(poll_interval).await;
         }
     }
 
@@ -865,7 +962,7 @@ mod tests {
 
         // Old leader (node 1) tries to send heartbeat to node 2
         // Node 2 will reject with higher term
-        let (still_leader, _) = tokio::join!(
+        let ((still_leader, _), _) = tokio::join!(
             server1.node.send_heartbeat(),
             handle2.process_one_shared(&shared2),
         );
@@ -2211,5 +2308,363 @@ mod tests {
             assert_eq!(core3.last_log_index(), leader_last,
                        "Follower 3 should have same last_log_index as leader");
         }
+    }
+
+    // === ReadIndex Tests ===
+
+    #[tokio::test(start_paused = true)]
+    async fn test_read_index_not_leader() {
+        use crate::transport::inmemory::create_cluster_with_timeout;
+
+        // A non-leader should return NotLeader error
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, _handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        let core1 = new_test_core(1, vec![2, 3]);
+        let transport1 = transports.remove(&1).unwrap();
+
+        // Use long election timeout so server doesn't start elections
+        let config = RaftConfig::default()
+            .with_election_timeout(Duration::from_secs(100), Duration::from_secs(100));
+
+        let (server1, _shared1) = RaftServer::with_config(core1, transport1, config);
+
+        // Start server but don't become leader
+        let handle = server1.start();
+
+        // Advance time to let server start
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+
+        // read_index should fail with NotLeader
+        let result = handle.read_index().await;
+        assert!(matches!(result, Err(RaftError::NotLeader { .. })),
+                "read_index should return NotLeader for follower");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_read_index_as_leader() {
+        use crate::transport::inmemory::create_cluster_with_timeout;
+
+        // A leader with majority should succeed
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        let core1 = new_test_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let config = RaftConfig::default()
+            .with_election_timeout(Duration::from_secs(100), Duration::from_secs(100));
+
+        let (server1, shared1) = RaftServer::with_config(core1, transport1, config);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Win election
+        server1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        // Start server
+        let handle = server1.start();
+
+        // Spawn handlers for heartbeat responses
+        let shared2_clone = shared2.clone();
+        let shared3_clone = shared3.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::join!(
+                    handle2.process_one_shared(&shared2_clone),
+                    handle3.process_one_shared(&shared3_clone),
+                );
+            }
+        });
+
+        // Advance time to let heartbeats complete
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // read_index should succeed
+        let result = handle.read_index().await;
+        assert!(result.is_ok(), "read_index should succeed for leader with majority");
+
+        // The returned index should be >= 1 (at least the NOOP entry)
+        let read_index = result.unwrap();
+        let commit_index = shared1.lock().await.commit_index;
+        assert!(read_index >= commit_index,
+                "read_index {} should be >= commit_index {}", read_index, commit_index);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_read_index_returns_last_applied() {
+        use crate::transport::inmemory::create_cluster_with_timeout;
+
+        // read_index should return last_applied after waiting for apply
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        let core1 = new_test_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let config = RaftConfig::default()
+            .with_election_timeout(Duration::from_secs(100), Duration::from_secs(100));
+
+        let (server1, shared1) = RaftServer::with_config(core1, transport1, config);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Win election
+        server1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        // Submit and replicate a command
+        {
+            let mut core = shared1.lock().await;
+            core.append_log_entry("CMD 1".to_string());
+        }
+        let (_, _, _) = tokio::join!(
+            server1.node.replicate_to_peers(2),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+
+        // Start server
+        let raft_handle = server1.start();
+
+        // Spawn handlers for heartbeat responses
+        let shared2_clone = shared2.clone();
+        let shared3_clone = shared3.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::join!(
+                    handle2.process_one_shared(&shared2_clone),
+                    handle3.process_one_shared(&shared3_clone),
+                );
+            }
+        });
+
+        // Advance time for heartbeats
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // read_index should return last_applied
+        let result = raft_handle.read_index().await;
+        assert!(result.is_ok(), "read_index should succeed");
+
+        let read_index = result.unwrap();
+        let last_applied = shared1.lock().await.last_applied;
+        assert_eq!(read_index, last_applied,
+                   "read_index should return last_applied");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_read_index_timeout_no_majority() {
+        use crate::transport::inmemory::create_cluster_with_timeout;
+
+        // When peers don't respond, should timeout
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(50);
+        let (mut transports, _handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        let core1 = new_test_core(1, vec![2, 3]);
+        let transport1 = transports.remove(&1).unwrap();
+
+        let config = RaftConfig::default()
+            .with_election_timeout(Duration::from_secs(100), Duration::from_secs(100));
+
+        let (server1, shared1) = RaftServer::with_config(core1, transport1, config);
+
+        // Manually become leader (bypassing election)
+        {
+            let mut core = shared1.lock().await;
+            core.become_leader();
+        }
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        // Start server (peers won't respond to heartbeats)
+        let handle = server1.start();
+
+        // Advance time past RPC timeout
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // read_index should fail with ReadTimeout (no majority response)
+        let result = handle.read_index().await;
+        assert!(matches!(result, Err(RaftError::ReadTimeout)),
+                "read_index should timeout without majority: {:?}", result);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_read_index_leader_steps_down() {
+        use crate::transport::inmemory::create_cluster_with_timeout;
+
+        // If leader discovers higher term during heartbeat, should return NotLeader
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        let core1 = new_test_core(1, vec![2, 3]);
+        let mut core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
+
+        // Node 2 has higher term
+        core2.current_term = 5;
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let config = RaftConfig::default()
+            .with_election_timeout(Duration::from_secs(100), Duration::from_secs(100));
+
+        let (server1, shared1) = RaftServer::with_config(core1, transport1, config);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        // Manually become leader at term 1
+        {
+            let mut core = shared1.lock().await;
+            core.become_leader();
+        }
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        // Start server
+        let handle = server1.start();
+
+        // Spawn handlers - node 2 will respond with higher term
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+        let shared2_clone = shared2.clone();
+        let shared3_clone = shared3.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::join!(
+                    handle2.process_one_shared(&shared2_clone),
+                    handle3.process_one_shared(&shared3_clone),
+                );
+            }
+        });
+
+        // Advance time for heartbeat
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // read_index should fail because leader stepped down after seeing higher term
+        let result = handle.read_index().await;
+        assert!(matches!(result, Err(RaftError::NotLeader { .. })),
+                "read_index should return NotLeader after stepping down: {:?}", result);
+
+        // Verify node stepped down
+        let state = shared1.lock().await.state;
+        assert_eq!(state, RaftState::Follower, "Node should have stepped down");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_read_index_with_pending_entries() {
+        use crate::transport::inmemory::create_cluster_with_timeout;
+
+        // Test that read_index waits for entries to be applied
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        let core1 = new_test_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let config = RaftConfig::default()
+            .with_election_timeout(Duration::from_secs(100), Duration::from_secs(100));
+
+        let (server1, shared1) = RaftServer::with_config(core1, transport1, config);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Win election
+        server1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+
+        // Submit multiple commands
+        for i in 1..=5 {
+            let mut core = shared1.lock().await;
+            core.append_log_entry(format!("CMD {}", i));
+        }
+
+        // Replicate all entries
+        let (_, _, _) = tokio::join!(
+            server1.node.replicate_to_peers(6), // NOOP + 5 commands
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+
+        // Verify committed
+        assert_eq!(shared1.lock().await.commit_index, 6);
+
+        // Start server
+        let raft_handle = server1.start();
+
+        // Spawn handlers
+        let shared2_clone = shared2.clone();
+        let shared3_clone = shared3.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::join!(
+                    handle2.process_one_shared(&shared2_clone),
+                    handle3.process_one_shared(&shared3_clone),
+                );
+            }
+        });
+
+        // Advance time
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // read_index should succeed and return >= commit_index
+        let result = raft_handle.read_index().await;
+        assert!(result.is_ok(), "read_index should succeed");
+
+        let read_index = result.unwrap();
+        assert!(read_index >= 6,
+                "read_index {} should be >= commit_index 6", read_index);
     }
 }
