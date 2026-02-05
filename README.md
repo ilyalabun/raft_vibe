@@ -1,87 +1,195 @@
-# Learning Raft in Rust 🦀
+# Raft Consensus in Rust
 
-Welcome! This project is designed to teach you both **Rust** and the **Raft consensus protocol** from scratch.
+An educational implementation of the [Raft consensus protocol](https://raft.github.io/raft.pdf) in Rust, built through "vibe coding" - iterative, conversational development with an AI assistant.
 
-## 📚 Learning Path
+## About This Project
 
-### Phase 1: Rust Basics (Start Here!)
-1. Read `rust_basics.md` - Essential Rust concepts you'll need
-2. Run examples: `cargo run --example basics`
+This project is designed for learning both Rust and distributed consensus concepts. It's not production-ready, but implements the core Raft features:
 
-### Phase 2: Understanding Raft
-1. Read the Raft paper: https://raft.github.io/raft.pdf (or watch videos)
-2. Key concepts:
-   - **Leader Election**: How nodes elect a leader
-   - **Log Replication**: How the leader replicates logs to followers
-   - **Safety**: Ensuring consistency across all nodes
+- **Leader Election** - Nodes elect a leader through randomized timeouts
+- **Log Replication** - Leader replicates log entries to followers
+- **Log Compaction** - Automatic snapshotting to prevent unbounded log growth
+- **Linearizable Reads** - ReadIndex algorithm for consistent reads
+- **Persistence** - File-based storage for crash recovery
 
-### Phase 3: Implementation
-We'll build Raft step by step:
-1. **Data Structures** - State, LogEntry, RPC messages
-2. **State Machine** - Follower, Candidate, Leader states
-3. **Election Logic** - RequestVote RPC
-4. **Log Replication** - AppendEntries RPC
-
-## 🏗️ Project Structure
-
-```
-raft_vibe/
-├── src/
-│   ├── main.rs              # Main entry point
-│   ├── raft.rs              # Core Raft implementation
-│   ├── state.rs             # Raft state machine
-│   └── rpc.rs               # RPC message types
-├── examples/
-│   └── basics.rs            # Rust basics examples
-├── rust_basics.md           # Rust tutorial
-└── README.md                # This file
-```
-
-## 🚀 Getting Started
+## Quick Start
 
 ### Prerequisites
-- Install Rust: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
-- Verify: `rustc --version` and `cargo --version`
 
-### Running the Project
+- Rust: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+
+### Build
+
 ```bash
-# Run the main program
-cargo run
-
-# Run with examples
-cargo run --example basics
-
-# Run tests
-cargo test
-
-# Build for release
 cargo build --release
 ```
 
-## 🎯 What is Raft?
+### Run Tests
 
-Raft is a consensus algorithm designed to be understandable. It's used in distributed systems to ensure all nodes agree on the same state.
+```bash
+cargo test
+```
 
-**Key Components:**
-- **Leader**: One node that handles all client requests
-- **Followers**: Other nodes that replicate the leader's log
-- **Elections**: When the leader fails, followers elect a new leader
-- **Log**: Ordered sequence of commands that all nodes must agree on
+## Running a Cluster
 
-## 📖 Resources
+### Using the Helper Script (Recommended)
 
-- [Raft Paper](https://raft.github.io/raft.pdf)
-- [Raft Visualization](https://raft.github.io/)
-- [Rust Book](https://doc.rust-lang.org/book/)
-- [Rust by Example](https://doc.rust-lang.org/rust-by-example/)
+```bash
+# Start a 3-node cluster
+./run_cluster.sh start
 
-## 💡 Vibe Coding Tips
+# Check cluster status
+./run_cluster.sh status
 
-When working with an AI assistant:
-1. **Ask questions** - Don't hesitate to ask "why" or "how does this work?"
-2. **Request explanations** - If code is unclear, ask for clarification
-3. **Iterate** - We can refine code together
-4. **Learn incrementally** - We'll build complexity gradually
+# Watch logs (colored by node)
+./run_cluster.sh watchlogs
 
-Let's start coding! 🚀
+# Kill a node to test failover
+./run_cluster.sh killnode 1
 
+# Restart a node
+./run_cluster.sh startnode 1
+
+# Stop the cluster
+./run_cluster.sh stop
+
+# Clean all data
+./run_cluster.sh clean
+```
+
+### Manual Cluster Setup
+
+Run each node in a separate terminal:
+
+```bash
+# Node 1
+cargo run --release --bin raft-server -- \
+    --id 1 --port 8001 --data-dir /tmp/raft1 \
+    --peers 2=127.0.0.1:8002,3=127.0.0.1:8003
+
+# Node 2
+cargo run --release --bin raft-server -- \
+    --id 2 --port 8002 --data-dir /tmp/raft2 \
+    --peers 1=127.0.0.1:8001,3=127.0.0.1:8003
+
+# Node 3
+cargo run --release --bin raft-server -- \
+    --id 3 --port 8003 --data-dir /tmp/raft3 \
+    --peers 1=127.0.0.1:8001,2=127.0.0.1:8002
+```
+
+### Client API
+
+```bash
+# Check node status
+curl http://127.0.0.1:8001/client/status
+
+# Check who is leader
+curl http://127.0.0.1:8001/client/leader
+
+# Submit a command (must go to leader)
+curl -X POST http://127.0.0.1:8001/client/submit \
+     -H 'Content-Type: application/json' \
+     -d '{"command": "SET mykey myvalue"}'
+
+# Linearizable read
+curl http://127.0.0.1:8001/client/read/mykey
+```
+
+## Architecture
+
+The codebase follows a layered architecture separating core Raft logic from async networking:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    HTTP Server (axum)                        │
+│  Client API: /client/submit, /client/read, /client/status   │
+│  Raft RPC:   /raft/request_vote, /raft/append_entries       │
+└─────────────────────────────────────────────────────────────┘
+                              │
+┌─────────────────────────────────────────────────────────────┐
+│                 RaftServer (raft_server.rs)                  │
+│  Event loop with election timeouts, heartbeats, client cmds │
+└─────────────────────────────────────────────────────────────┘
+                              │
+┌─────────────────────────────────────────────────────────────┐
+│                  RaftNode (raft_node.rs)                     │
+│  Async operations: request_votes(), replicate_to_peers()    │
+└─────────────────────────────────────────────────────────────┘
+                              │
+         ┌────────────────────┴────────────────────┐
+         │                                         │
+┌────────────────────┐                 ┌───────────────────────┐
+│ RaftCore           │                 │ Transport             │
+│ (raft_core.rs)     │                 │ (transport/*.rs)      │
+│                    │                 │                       │
+│ Pure state machine │                 │ HttpTransport         │
+│ - Election logic   │                 │ InMemoryTransport     │
+│ - Log replication  │                 │                       │
+│ - Snapshotting     │                 │                       │
+└────────────────────┘                 └───────────────────────┘
+         │
+┌────────────────────┐
+│ Storage            │
+│ (storage/*.rs)     │
+│                    │
+│ FileStorage        │
+│ MemoryStorage      │
+└────────────────────┘
+```
+
+### Layer Details
+
+| Layer | File | Description |
+|-------|------|-------------|
+| **RaftCore** | `src/core/raft_core.rs` | Synchronous, transport-agnostic state machine. Handles RequestVote, AppendEntries, elections, and log management. |
+| **RaftNode** | `src/core/raft_node.rs` | Wraps RaftCore with async operations. Sends RPCs to all peers concurrently. |
+| **RaftServer** | `src/core/raft_server.rs` | Event-driven server loop. Manages election timeouts (300-500ms), heartbeats (150ms), and client commands. |
+| **Transport** | `src/transport/` | Network abstraction. `HttpTransport` for production, `InMemoryTransport` for testing. |
+| **Storage** | `src/storage/` | Persistence layer. `FileStorage` for durability, `MemoryStorage` for testing. |
+| **State Machine** | `src/state_machine/` | Pluggable state machines. Includes `KeyValueStore` implementation. |
+
+## Project Structure
+
+```
+src/
+├── bin/
+│   └── server.rs           # Raft server binary
+├── core/
+│   ├── raft_core.rs        # Core Raft state machine
+│   ├── raft_node.rs        # Async wrapper for RaftCore
+│   ├── raft_server.rs      # Event-driven server loop
+│   ├── config.rs           # Configuration builder
+│   └── snapshot.rs         # Snapshot data structures
+├── transport/
+│   ├── traits.rs           # Transport trait definition
+│   ├── http.rs             # HTTP transport implementation
+│   └── inmemory.rs         # In-memory transport for testing
+├── storage/
+│   ├── traits.rs           # Storage trait definition
+│   ├── file.rs             # File-based persistent storage
+│   └── memory.rs           # In-memory storage for testing
+├── state_machine/
+│   ├── traits.rs           # State machine trait
+│   └── kv.rs               # Key-value store implementation
+├── api/
+│   └── client_http.rs      # HTTP API for clients
+└── lib.rs                  # Library exports
+```
+
+## Resources
+
+- [Raft Paper](https://raft.github.io/raft.pdf) - The original paper
+- [Raft Visualization](https://raft.github.io/) - Interactive visualization
+- [Rust Book](https://doc.rust-lang.org/book/) - Learn Rust
+
+## Development
+
+See `CLAUDE.md` for development guidelines and `LOG.md` for session history.
+
+```bash
+cargo build              # Build the project
+cargo test               # Run all tests
+cargo test <test_name>   # Run a single test
+cargo test -- --nocapture  # Run tests with stdout visible
+```
