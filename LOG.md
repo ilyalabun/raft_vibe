@@ -665,6 +665,62 @@ All 192 tests pass (179 unit tests + 13 integration tests).
 
 ---
 
+## Day 14: API Improvements and Command Validation
+
+**Prompt:** "I want transport and API to run on different ports"
+
+**Separating Transport and API Ports**
+
+Split the Raft server into two HTTP servers running on different ports. Previously, both inter-node Raft communication and client API shared the same port. Now the server uses explicit `--transport-port` and `--api-port` flags. The port scheme follows: Node X uses transport=800X, api=900X. This provides better isolation between cluster communication and client requests.
+
+**Prompt:** "I want RESTful KV endpoints"
+
+**RESTful KV API**
+
+Replaced the generic `/client/submit` and `/client/read/:key` endpoints with cleaner RESTful `/kv/:key` endpoints:
+- `POST /kv/:key` with JSON body `{"value": "..."}` - Set a key-value pair
+- `GET /kv/:key` - Linearizable read via ReadIndex
+- `DELETE /kv/:key` - Delete a key
+
+The `/client/leader` and `/client/status` endpoints remain unchanged for cluster introspection.
+
+**Prompt:** "I want my state machine validate commands *before* appending entry to the log"
+
+**Adding Pre-Append Command Validation**
+
+Implemented command validation before entries are appended to the Raft log. Previously, commands were only validated when applied to the state machine (after commitment). Now invalid commands are rejected immediately, providing fast feedback to clients and preventing invalid commands from being replicated across the cluster.
+
+**StateMachine Trait Extension**
+
+Added a required `validate(&self, command: &str) -> Result<(), String>` method to the `StateMachine` trait. Initially implemented with a default that accepts all commands, but then changed to require explicit implementation - this forces all state machine implementations to think about validation.
+
+**KeyValueStore Validation**
+
+Implemented `validate()` for `KeyValueStore` that checks command format:
+- `SET key value` - valid
+- `DELETE key` - valid
+- `NOOP` - valid (internal command for leader election)
+- Everything else - invalid with "unknown command" error
+
+**Integration into RaftServer**
+
+Added `InvalidCommand(String)` variant to `RaftError`. Modified `handle_submit()` to call `core.validate_command(&command)` before `append_log_entry()`. Invalid commands return immediately without touching the log.
+
+**HTTP API Updates**
+
+Updated all HTTP handlers (`handle_submit`, `handle_kv_set`, `handle_kv_delete`) to handle `InvalidCommand` error, returning HTTP 400 Bad Request with the validation error message.
+
+**Testing**
+
+Added comprehensive tests:
+- `kv.rs`: 4 tests for `validate()` method (SET, DELETE, NOOP, invalid commands)
+- `raft_server.rs`: 2 tests using a custom `ValidatingStateMachine` that rejects commands starting with "INVALID"
+- `client_http.rs`: 1 test verifying HTTP 400 response for invalid commands
+
+All 199 tests pass.
+
+---
+
 ## Next Up
 
 - Potential future work: Dynamic cluster membership, cluster configuration changes
