@@ -1,16 +1,17 @@
 //! HTTP client API for Raft cluster
 //!
-//! Provides HTTP endpoints for external clients to interact with the Raft cluster:
-//! - Submit commands to the leader
-//! - Linearizable reads via ReadIndex
+//! Provides RESTful HTTP endpoints for external clients to interact with the Raft cluster:
+//! - GET /kv/:key - Linearizable read via ReadIndex
+//! - POST /kv/:key - Set a key-value pair
+//! - DELETE /kv/:key - Delete a key
 //! - Query cluster status and leader information
 
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -32,14 +33,39 @@ pub struct ClientState {
     pub core: SharedCore,
 }
 
-/// Request body for submitting a command
+/// Request body for POST /kv/:key
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvSetRequest {
+    /// The value to set
+    pub value: String,
+}
+
+/// Response for GET /kv/:key
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvGetResponse {
+    /// The key that was read
+    pub key: String,
+    /// The value (None if key doesn't exist)
+    pub value: Option<String>,
+}
+
+/// Response for POST /kv/:key and DELETE /kv/:key
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvMutationResponse {
+    /// The key that was modified
+    pub key: String,
+    /// Whether the operation succeeded
+    pub success: bool,
+}
+
+/// Request body for submitting a command (legacy, used by create_client_router_full)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitRequest {
     /// The command to submit (e.g., "SET key value")
     pub command: String,
 }
 
-/// Response from a successful submit
+/// Response from a successful submit (legacy, used by create_client_router_full)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitResponse {
     /// Result from the state machine
@@ -86,17 +112,6 @@ pub struct StatusResponse {
     pub log_length: u64,
 }
 
-/// Response from a linearizable read
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReadResponse {
-    /// The key that was read
-    pub key: String,
-    /// The value (None if key doesn't exist)
-    pub value: Option<String>,
-    /// The read index used for linearizability
-    pub read_index: u64,
-}
-
 /// State for client HTTP handlers with KV store access for linearizable reads
 #[derive(Clone)]
 pub struct ClientStateWithKv {
@@ -126,7 +141,7 @@ pub fn create_client_router_full(handle: RaftHandle, core: SharedCore) -> Router
         .with_state(state)
 }
 
-/// Create an axum router for client HTTP API with linearizable reads
+/// Create an axum router for client HTTP API with RESTful KV endpoints
 pub fn create_client_router_with_reads(
     handle: RaftHandle,
     core: SharedCore,
@@ -138,8 +153,9 @@ pub fn create_client_router_with_reads(
         kv_store,
     };
     Router::new()
-        .route("/client/submit", post(handle_submit_kv))
-        .route("/client/read/:key", get(handle_linearizable_read))
+        .route("/kv/:key", get(handle_kv_get))
+        .route("/kv/:key", post(handle_kv_set))
+        .route("/kv/:key", delete(handle_kv_delete))
         .route("/client/leader", get(handle_leader_kv))
         .route("/client/status", get(handle_status_kv))
         .with_state(state)
@@ -191,13 +207,15 @@ pub async fn handle_submit(
     }
 }
 
-/// Handle POST /client/submit - submit a command (with KV store state)
-async fn handle_submit_kv(
+/// Handle POST /kv/:key - set a key-value pair
+async fn handle_kv_set(
     State(state): State<ClientStateWithKv>,
-    Json(request): Json<SubmitRequest>,
-) -> Result<Json<SubmitResponse>, (StatusCode, Json<ErrorResponse>)> {
-    match state.handle.submit(request.command).await {
-        Ok(result) => Ok(Json(SubmitResponse { result })),
+    Path(key): Path<String>,
+    Json(request): Json<KvSetRequest>,
+) -> Result<Json<KvMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let command = format!("SET {} {}", key, request.value);
+    match state.handle.submit(command).await {
+        Ok(_) => Ok(Json(KvMutationResponse { key, success: true })),
         Err(RaftError::NotLeader { leader_hint }) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
@@ -236,14 +254,14 @@ async fn handle_submit_kv(
     }
 }
 
-/// Handle GET /client/read/:key - linearizable read using ReadIndex
-pub async fn handle_linearizable_read(
+/// Handle GET /kv/:key - linearizable read using ReadIndex
+pub async fn handle_kv_get(
     State(state): State<ClientStateWithKv>,
-    axum::extract::Path(key): axum::extract::Path<String>,
-) -> Result<Json<ReadResponse>, (StatusCode, Json<ErrorResponse>)> {
+    Path(key): Path<String>,
+) -> Result<Json<KvGetResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Step 1: Get read_index (confirms leadership with majority)
-    let read_index = match state.handle.read_index().await {
-        Ok(index) => index,
+    match state.handle.read_index().await {
+        Ok(_) => {}
         Err(RaftError::NotLeader { leader_hint }) => {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -276,11 +294,53 @@ pub async fn handle_linearizable_read(
     // Step 2: Read from state machine (we've confirmed we're up to date)
     let value = state.kv_store.lock().unwrap().get(&key);
 
-    Ok(Json(ReadResponse {
-        key,
-        value,
-        read_index,
-    }))
+    Ok(Json(KvGetResponse { key, value }))
+}
+
+/// Handle DELETE /kv/:key - delete a key
+async fn handle_kv_delete(
+    State(state): State<ClientStateWithKv>,
+    Path(key): Path<String>,
+) -> Result<Json<KvMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let command = format!("DELETE {}", key);
+    match state.handle.submit(command).await {
+        Ok(_) => Ok(Json(KvMutationResponse { key, success: true })),
+        Err(RaftError::NotLeader { leader_hint }) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Not the leader".to_string(),
+                leader_hint,
+            }),
+        )),
+        Err(RaftError::NotCommitted) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Entry not committed (couldn't reach majority)".to_string(),
+                leader_hint: None,
+            }),
+        )),
+        Err(RaftError::StateMachine(err)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("State machine error: {}", err),
+                leader_hint: None,
+            }),
+        )),
+        Err(RaftError::Transport(_)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Transport error".to_string(),
+                leader_hint: None,
+            }),
+        )),
+        Err(RaftError::ReadTimeout) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Read timeout".to_string(),
+                leader_hint: None,
+            }),
+        )),
+    }
 }
 
 /// Handle GET /client/leader - get current leader information (with KV store state)

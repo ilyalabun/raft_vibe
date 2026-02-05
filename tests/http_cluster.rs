@@ -12,8 +12,8 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use raft_vibe::api::client_http::{
-    create_client_router_with_reads, ErrorResponse, LeaderResponse, ReadResponse, StatusResponse,
-    SubmitResponse,
+    create_client_router_with_reads, ErrorResponse, KvGetResponse, KvMutationResponse,
+    LeaderResponse, StatusResponse,
 };
 use raft_vibe::core::config::RaftConfig;
 use raft_vibe::core::raft_core::RaftCore;
@@ -264,20 +264,29 @@ async fn get_leader(
         .await
 }
 
+/// Submit a SET command via the RESTful KV API
 async fn submit_command(
     client: &reqwest::Client,
     addr: &SocketAddr,
     command: &str,
-) -> Result<SubmitResponse, SubmitError> {
+) -> Result<KvMutationResponse, SubmitError> {
+    // Parse command to extract key and value (format: "SET key value")
+    let parts: Vec<&str> = command.splitn(3, ' ').collect();
+    if parts.len() < 3 || parts[0] != "SET" {
+        return Err(SubmitError::Network(format!("Invalid command format: {}", command)));
+    }
+    let key = parts[1];
+    let value = parts[2];
+
     let response = client
-        .post(format!("http://{}/client/submit", addr))
-        .json(&serde_json::json!({ "command": command }))
+        .post(format!("http://{}/kv/{}", addr, key))
+        .json(&serde_json::json!({ "value": value }))
         .send()
         .await
         .map_err(|e| SubmitError::Network(e.to_string()))?;
 
     if response.status().is_success() {
-        let result: SubmitResponse = response
+        let result: KvMutationResponse = response
             .json()
             .await
             .map_err(|e| SubmitError::Network(e.to_string()))?;
@@ -294,20 +303,20 @@ async fn submit_command(
     }
 }
 
-/// Perform a linearizable read via the ReadIndex protocol
+/// Perform a linearizable read via the RESTful KV API
 async fn linearizable_read(
     client: &reqwest::Client,
     addr: &SocketAddr,
     key: &str,
-) -> Result<ReadResponse, ReadError> {
+) -> Result<KvGetResponse, ReadError> {
     let response = client
-        .get(format!("http://{}/client/read/{}", addr, key))
+        .get(format!("http://{}/kv/{}", addr, key))
         .send()
         .await
         .map_err(|e| ReadError::Network(e.to_string()))?;
 
     if response.status().is_success() {
-        let result: ReadResponse = response
+        let result: KvGetResponse = response
             .json()
             .await
             .map_err(|e| ReadError::Network(e.to_string()))?;
@@ -952,7 +961,6 @@ async fn test_linearizable_read_as_leader() {
 
     assert_eq!(read_result.key, "mykey");
     assert_eq!(read_result.value, Some("myvalue".to_string()));
-    assert!(read_result.read_index > 0, "read_index should be > 0");
 
     cluster.shutdown().await;
 }
@@ -977,8 +985,6 @@ async fn test_linearizable_read_missing_key() {
 
     assert_eq!(read_result.key, "nonexistent");
     assert_eq!(read_result.value, None);
-    // read_index is u64 so it's always >= 0, just verify it exists
-    let _ = read_result.read_index;
 
     cluster.shutdown().await;
 }

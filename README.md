@@ -93,13 +93,16 @@ curl http://127.0.0.1:9001/client/status
 # Check who is leader
 curl http://127.0.0.1:9001/client/leader
 
-# Submit a command (must go to leader)
-curl -X POST http://127.0.0.1:9001/client/submit \
+# Set a key (must go to leader)
+curl -X POST http://127.0.0.1:9001/kv/mykey \
      -H 'Content-Type: application/json' \
-     -d '{"command": "SET mykey myvalue"}'
+     -d '{"value": "myvalue"}'
 
-# Linearizable read
-curl http://127.0.0.1:9001/client/read/mykey
+# Get a key (linearizable read via ReadIndex)
+curl http://127.0.0.1:9001/kv/mykey
+
+# Delete a key
+curl -X DELETE http://127.0.0.1:9001/kv/mykey
 ```
 
 ## Architecture
@@ -109,9 +112,9 @@ The codebase follows a layered architecture separating core Raft logic from asyn
 ```
 ┌─────────────────────────────┐   ┌─────────────────────────────┐
 │   API Server (port 900X)    │   │ Transport Server (port 800X)│
-│  /client/submit             │   │  /raft/request_vote         │
-│  /client/read               │   │  /raft/append_entries       │
-│  /client/status             │   │  /raft/install_snapshot     │
+│  /kv/:key (GET/POST/DELETE) │   │  /raft/request_vote         │
+│  /client/status             │   │  /raft/append_entries       │
+│  /client/leader             │   │  /raft/install_snapshot     │
 └─────────────────────────────┘   └─────────────────────────────┘
                        │                        │
                        └───────────┬────────────┘
