@@ -1,16 +1,20 @@
 //! Raft server binary
 //!
-//! Runs a single Raft node with HTTP API for both cluster communication and clients.
+//! Runs a single Raft node with separate ports for cluster transport and client API.
 //!
-//! Usage: raft-server --id <NODE_ID> --port <PORT> --data-dir <DIR> --peers <PEER1,PEER2,...> [--snapshot-threshold N]
+//! Usage: raft-server --id <NODE_ID> --transport-port <PORT> --api-port <PORT> --data-dir <DIR> --peers <PEER1,PEER2,...> [--snapshot-threshold N]
 //!
 //! Example for a 3-node cluster:
-//!   Node 1: raft-server --id 1 --port 8001 --data-dir /tmp/raft1 --peers 2=127.0.0.1:8002,3=127.0.0.1:8003
-//!   Node 2: raft-server --id 2 --port 8002 --data-dir /tmp/raft2 --peers 1=127.0.0.1:8001,3=127.0.0.1:8003
-//!   Node 3: raft-server --id 3 --port 8003 --data-dir /tmp/raft3 --peers 1=127.0.0.1:8001,2=127.0.0.1:8002
+//!   Node 1: raft-server --id 1 --transport-port 8001 --api-port 9001 --data-dir /tmp/raft1 --peers 2=127.0.0.1:8002,3=127.0.0.1:8003
+//!   Node 2: raft-server --id 2 --transport-port 8002 --api-port 9002 --data-dir /tmp/raft2 --peers 1=127.0.0.1:8001,3=127.0.0.1:8003
+//!   Node 3: raft-server --id 3 --transport-port 8003 --api-port 9003 --data-dir /tmp/raft3 --peers 1=127.0.0.1:8001,2=127.0.0.1:8002
 //!
 //! Options:
 //!   --snapshot-threshold N    Take snapshot after N entries (default: 1000, set to 0 to disable)
+//!
+//! Ports:
+//!   --transport-port: Used for Raft RPC between nodes (/raft/* endpoints)
+//!   --api-port: Used for client requests (/client/* endpoints)
 
 use std::collections::HashMap;
 use std::env;
@@ -18,20 +22,19 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::Router;
-
 use raft_vibe::api::client_http::create_client_router_with_reads;
 use raft_vibe::core::raft_core::RaftCore;
 use raft_vibe::core::raft_server::RaftServer;
 use raft_vibe::state_machine::kv::{KeyValueStore, SharedKvStore};
 use raft_vibe::storage::file::FileStorage;
-use raft_vibe::transport::http::{create_router, HttpTransport, SharedCore};
+use raft_vibe::transport::http::{create_router, HttpTransport};
 
-fn parse_args() -> (u64, u16, String, HashMap<u64, String>, u64) {
+fn parse_args() -> (u64, u16, u16, String, HashMap<u64, String>, u64) {
     let args: Vec<String> = env::args().collect();
 
     let mut id: Option<u64> = None;
-    let mut port: Option<u16> = None;
+    let mut transport_port: Option<u16> = None;
+    let mut api_port: Option<u16> = None;
     let mut data_dir: Option<String> = None;
     let mut peers: HashMap<u64, String> = HashMap::new();
     let mut snapshot_threshold: u64 = 1000; // Default
@@ -43,8 +46,12 @@ fn parse_args() -> (u64, u16, String, HashMap<u64, String>, u64) {
                 id = Some(args[i + 1].parse().expect("Invalid node ID"));
                 i += 2;
             }
-            "--port" => {
-                port = Some(args[i + 1].parse().expect("Invalid port"));
+            "--transport-port" => {
+                transport_port = Some(args[i + 1].parse().expect("Invalid transport port"));
+                i += 2;
+            }
+            "--api-port" => {
+                api_port = Some(args[i + 1].parse().expect("Invalid API port"));
                 i += 2;
             }
             "--data-dir" => {
@@ -74,17 +81,18 @@ fn parse_args() -> (u64, u16, String, HashMap<u64, String>, u64) {
     }
 
     let id = id.expect("--id is required");
-    let port = port.expect("--port is required");
+    let transport_port = transport_port.expect("--transport-port is required");
+    let api_port = api_port.expect("--api-port is required");
     let data_dir = data_dir.expect("--data-dir is required");
 
-    (id, port, data_dir, peers, snapshot_threshold)
+    (id, transport_port, api_port, data_dir, peers, snapshot_threshold)
 }
 
 #[tokio::main]
 async fn main() {
-    let (id, port, data_dir, peers, snapshot_threshold) = parse_args();
+    let (id, transport_port, api_port, data_dir, peers, snapshot_threshold) = parse_args();
 
-    println!("[NODE {}] Starting on port {}", id, port);
+    println!("[NODE {}] Starting with transport port {} and API port {}", id, transport_port, api_port);
     println!("[NODE {}] Data directory: {}", id, data_dir);
     println!("[NODE {}] Peers: {:?}", id, peers);
     println!("[NODE {}] Snapshot threshold: {} entries", id, snapshot_threshold);
@@ -116,35 +124,31 @@ async fn main() {
     // Start the server loop (returns handle for client commands)
     let raft_handle = server.start();
 
-    // Create combined router with both Raft RPC and client API
-    let app = create_combined_router(shared_core.clone(), raft_handle, shared_core, kv_store);
+    // Create separate routers for transport and API
+    let raft_router = create_router(shared_core.clone());
+    let client_router = create_client_router_with_reads(raft_handle, shared_core, kv_store);
 
-    // Start HTTP server
-    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
-    println!("[NODE {}] Listening on {}", id, addr);
-    println!("[NODE {}] Client API:", id);
+    // Start transport server (for Raft RPC)
+    let transport_addr: SocketAddr = format!("0.0.0.0:{}", transport_port).parse().unwrap();
+    println!("[NODE {}] Transport server listening on {}", id, transport_addr);
+    println!("[NODE {}]   POST /raft/request_vote     - RequestVote RPC", id);
+    println!("[NODE {}]   POST /raft/append_entries   - AppendEntries RPC", id);
+    println!("[NODE {}]   POST /raft/install_snapshot - InstallSnapshot RPC", id);
+
+    let transport_listener = tokio::net::TcpListener::bind(transport_addr).await.unwrap();
+    tokio::spawn(async move {
+        axum::serve(transport_listener, raft_router).await.unwrap();
+    });
+
+    // Start API server (for client requests)
+    let api_addr: SocketAddr = format!("0.0.0.0:{}", api_port).parse().unwrap();
+    println!("[NODE {}] API server listening on {}", id, api_addr);
     println!("[NODE {}]   POST /client/submit       - Submit a command", id);
     println!("[NODE {}]   GET  /client/read/:key   - Linearizable read", id);
     println!("[NODE {}]   GET  /client/leader      - Get leader info", id);
     println!("[NODE {}]   GET  /client/status      - Get node status", id);
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let api_listener = tokio::net::TcpListener::bind(api_addr).await.unwrap();
+    axum::serve(api_listener, client_router).await.unwrap();
 }
 
-/// Create a combined router with both Raft RPC and client API routes
-fn create_combined_router(
-    raft_core: SharedCore,
-    raft_handle: raft_vibe::core::raft_server::RaftHandle,
-    client_core: SharedCore,
-    kv_store: SharedKvStore,
-) -> Router {
-    // Raft RPC routes (/raft/*)
-    let raft_router = create_router(raft_core);
-
-    // Client API routes (/client/*) with linearizable reads
-    let client_router = create_client_router_with_reads(raft_handle, client_core, kv_store);
-
-    // Merge routers
-    raft_router.merge(client_router)
-}

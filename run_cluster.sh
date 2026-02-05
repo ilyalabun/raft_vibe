@@ -19,10 +19,11 @@ start_cluster() {
     echo ""
 
     # Start node 1
-    echo "Starting node 1 on port 8001..."
+    echo "Starting node 1 (transport=8001, api=9001)..."
     ./target/release/raft-server \
         --id 1 \
-        --port 8001 \
+        --transport-port 8001 \
+        --api-port 9001 \
         --data-dir "$DATA_DIR/node1" \
         --peers 2=127.0.0.1:8002,3=127.0.0.1:8003 \
         --snapshot-threshold 10 \
@@ -30,10 +31,11 @@ start_cluster() {
     echo $! > "$DATA_DIR/node1.pid"
 
     # Start node 2
-    echo "Starting node 2 on port 8002..."
+    echo "Starting node 2 (transport=8002, api=9002)..."
     ./target/release/raft-server \
         --id 2 \
-        --port 8002 \
+        --transport-port 8002 \
+        --api-port 9002 \
         --data-dir "$DATA_DIR/node2" \
         --peers 1=127.0.0.1:8001,3=127.0.0.1:8003 \
         --snapshot-threshold 10 \
@@ -41,10 +43,11 @@ start_cluster() {
     echo $! > "$DATA_DIR/node2.pid"
 
     # Start node 3
-    echo "Starting node 3 on port 8003..."
+    echo "Starting node 3 (transport=8003, api=9003)..."
     ./target/release/raft-server \
         --id 3 \
-        --port 8003 \
+        --transport-port 8003 \
+        --api-port 9003 \
         --data-dir "$DATA_DIR/node3" \
         --peers 1=127.0.0.1:8001,2=127.0.0.1:8002 \
         --snapshot-threshold 10 \
@@ -58,24 +61,24 @@ start_cluster() {
     echo "  Snapshot threshold: 10 entries (snapshots trigger frequently for testing)"
     echo ""
     echo "Node endpoints:"
-    echo "  Node 1: http://127.0.0.1:8001"
-    echo "  Node 2: http://127.0.0.1:8002"
-    echo "  Node 3: http://127.0.0.1:8003"
+    echo "  Node 1: transport=http://127.0.0.1:8001, api=http://127.0.0.1:9001"
+    echo "  Node 2: transport=http://127.0.0.1:8002, api=http://127.0.0.1:9002"
+    echo "  Node 3: transport=http://127.0.0.1:8003, api=http://127.0.0.1:9003"
     echo ""
-    echo "Client API examples:"
+    echo "Client API examples (use API port 900X):"
     echo "  # Check status"
-    echo "  curl http://127.0.0.1:8001/client/status"
+    echo "  curl http://127.0.0.1:9001/client/status"
     echo ""
     echo "  # Check leader"
-    echo "  curl http://127.0.0.1:8001/client/leader"
+    echo "  curl http://127.0.0.1:9001/client/leader"
     echo ""
     echo "  # Submit a command (to leader)"
-    echo "  curl -X POST http://127.0.0.1:8001/client/submit \\"
+    echo "  curl -X POST http://127.0.0.1:9001/client/submit \\"
     echo "       -H 'Content-Type: application/json' \\"
     echo "       -d '{\"command\": \"SET mykey myvalue\"}'"
     echo ""
     echo "  # Submit many commands to see automatic snapshots:"
-    echo "  for i in {1..15}; do curl -X POST http://127.0.0.1:8001/client/submit \\"
+    echo "  for i in {1..15}; do curl -X POST http://127.0.0.1:9001/client/submit \\"
     echo "       -H 'Content-Type: application/json' \\"
     echo "       -d \"{\\\"command\\\": \\\"SET key\$i value\$i\\\"}\"; done"
     echo ""
@@ -109,11 +112,11 @@ clean_cluster() {
 status_cluster() {
     echo "Cluster status:"
     for i in 1 2 3; do
-        port=$((8000 + i))
-        echo -n "  Node $i (port $port): "
-        if curl -s "http://127.0.0.1:$port/client/status" > /dev/null 2>&1; then
-            state=$(curl -s "http://127.0.0.1:$port/client/status" | grep -o '"state":"[^"]*"' | cut -d'"' -f4)
-            term=$(curl -s "http://127.0.0.1:$port/client/status" | grep -o '"term":[0-9]*' | cut -d':' -f2)
+        api_port=$((9000 + i))
+        echo -n "  Node $i (api port $api_port): "
+        if curl -s "http://127.0.0.1:$api_port/client/status" > /dev/null 2>&1; then
+            state=$(curl -s "http://127.0.0.1:$api_port/client/status" | grep -o '"state":"[^"]*"' | cut -d'"' -f4)
+            term=$(curl -s "http://127.0.0.1:$api_port/client/status" | grep -o '"term":[0-9]*' | cut -d':' -f2)
             echo "$state (term $term)"
         else
             echo "not responding"
@@ -169,11 +172,13 @@ start_node() {
         fi
     done
 
-    local port=$((8000 + node_id))
-    echo "Starting node $node_id on port $port..."
+    local transport_port=$((8000 + node_id))
+    local api_port=$((9000 + node_id))
+    echo "Starting node $node_id (transport=$transport_port, api=$api_port)..."
     ./target/release/raft-server \
         --id "$node_id" \
-        --port "$port" \
+        --transport-port "$transport_port" \
+        --api-port "$api_port" \
         --data-dir "$DATA_DIR/node$node_id" \
         --peers "$peers" \
         --snapshot-threshold 10 \

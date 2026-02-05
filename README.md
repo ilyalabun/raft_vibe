@@ -64,36 +64,42 @@ Run each node in a separate terminal:
 ```bash
 # Node 1
 cargo run --release --bin raft-server -- \
-    --id 1 --port 8001 --data-dir /tmp/raft1 \
+    --id 1 --transport-port 8001 --api-port 9001 --data-dir /tmp/raft1 \
     --peers 2=127.0.0.1:8002,3=127.0.0.1:8003
 
 # Node 2
 cargo run --release --bin raft-server -- \
-    --id 2 --port 8002 --data-dir /tmp/raft2 \
+    --id 2 --transport-port 8002 --api-port 9002 --data-dir /tmp/raft2 \
     --peers 1=127.0.0.1:8001,3=127.0.0.1:8003
 
 # Node 3
 cargo run --release --bin raft-server -- \
-    --id 3 --port 8003 --data-dir /tmp/raft3 \
+    --id 3 --transport-port 8003 --api-port 9003 --data-dir /tmp/raft3 \
     --peers 1=127.0.0.1:8001,2=127.0.0.1:8002
 ```
 
+Each node runs two HTTP servers:
+- **Transport port (800X)**: Raft RPC between nodes (`/raft/*` endpoints)
+- **API port (900X)**: Client requests (`/client/*` endpoints)
+
 ### Client API
+
+Use the API port (900X) for client requests:
 
 ```bash
 # Check node status
-curl http://127.0.0.1:8001/client/status
+curl http://127.0.0.1:9001/client/status
 
 # Check who is leader
-curl http://127.0.0.1:8001/client/leader
+curl http://127.0.0.1:9001/client/leader
 
 # Submit a command (must go to leader)
-curl -X POST http://127.0.0.1:8001/client/submit \
+curl -X POST http://127.0.0.1:9001/client/submit \
      -H 'Content-Type: application/json' \
      -d '{"command": "SET mykey myvalue"}'
 
 # Linearizable read
-curl http://127.0.0.1:8001/client/read/mykey
+curl http://127.0.0.1:9001/client/read/mykey
 ```
 
 ## Architecture
@@ -101,12 +107,15 @@ curl http://127.0.0.1:8001/client/read/mykey
 The codebase follows a layered architecture separating core Raft logic from async networking:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    HTTP Server (axum)                        │
-│  Client API: /client/submit, /client/read, /client/status   │
-│  Raft RPC:   /raft/request_vote, /raft/append_entries       │
-└─────────────────────────────────────────────────────────────┘
-                              │
+┌─────────────────────────────┐   ┌─────────────────────────────┐
+│   API Server (port 900X)    │   │ Transport Server (port 800X)│
+│  /client/submit             │   │  /raft/request_vote         │
+│  /client/read               │   │  /raft/append_entries       │
+│  /client/status             │   │  /raft/install_snapshot     │
+└─────────────────────────────┘   └─────────────────────────────┘
+                       │                        │
+                       └───────────┬────────────┘
+                                   │
 ┌─────────────────────────────────────────────────────────────┐
 │                 RaftServer (raft_server.rs)                  │
 │  Event loop with election timeouts, heartbeats, client cmds │
