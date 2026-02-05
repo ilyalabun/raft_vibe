@@ -16,6 +16,8 @@ pub enum RaftError {
     NotLeader { leader_hint: Option<u64> },
     /// Entry was not committed (couldn't reach majority)
     NotCommitted,
+    /// Command failed validation before appending to log
+    InvalidCommand(String),
     /// State machine returned an error
     StateMachine(String),
     /// Transport error occurred
@@ -211,6 +213,10 @@ impl<T: Transport + 'static> RaftServer<T> {
             if core.state != RaftState::Leader {
                 return Err(RaftError::NotLeader { leader_hint: core.current_leader });
             }
+
+            // Validate command before appending to log
+            core.validate_command(&command)
+                .map_err(RaftError::InvalidCommand)?;
 
             // Append to local log
             let entry = core.append_log_entry(command).ok_or(RaftError::NotLeader { leader_hint: None })?;
@@ -2666,5 +2672,174 @@ mod tests {
         let read_index = result.unwrap();
         assert!(read_index >= 6,
                 "read_index {} should be >= commit_index 6", read_index);
+    }
+
+    // === Command Validation Tests ===
+
+    /// Test state machine that rejects commands starting with "INVALID"
+    struct ValidatingStateMachine;
+
+    impl crate::state_machine::StateMachine for ValidatingStateMachine {
+        fn validate(&self, command: &str) -> Result<(), String> {
+            if command.starts_with("INVALID") {
+                Err(format!("rejected command: {}", command))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn apply(&mut self, _command: &str) -> crate::state_machine::ApplyResult {
+            Ok(String::new())
+        }
+    }
+
+    impl crate::state_machine::Snapshotable for ValidatingStateMachine {
+        fn snapshot(&self) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+
+        fn restore(&mut self, _data: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn new_validating_core(id: u64, peers: Vec<u64>) -> RaftCore {
+        RaftCore::new(
+            id,
+            peers,
+            Box::new(MemoryStorage::new()),
+            Box::new(ValidatingStateMachine),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_invalid_command_rejected_before_log_append() {
+        use crate::transport::inmemory::create_cluster_with_timeout;
+
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        let core1 = new_validating_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let config = RaftConfig::default()
+            .with_election_timeout(Duration::from_secs(100), Duration::from_secs(100));
+
+        let (server1, shared1, ) = RaftServer::with_config(core1, transport1, config);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Win election
+        server1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        let client_handle = server1.start();
+
+        // Submit invalid command
+        let submit_task = tokio::spawn({
+            let handle = client_handle.clone();
+            async move {
+                handle.submit("INVALID command".to_string()).await
+            }
+        });
+
+        // Advance time to let task run
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+
+        let result = submit_task.await.unwrap();
+
+        // Should get InvalidCommand error
+        assert!(matches!(result, Err(RaftError::InvalidCommand(_))));
+        if let Err(RaftError::InvalidCommand(msg)) = result {
+            assert!(msg.contains("INVALID"));
+        }
+
+        // Log should only have NOOP (no invalid command appended)
+        assert_eq!(shared1.lock().await.log.len(), 1);
+        assert_eq!(shared1.lock().await.log[0].command, crate::core::raft_core::NOOP_COMMAND);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_valid_command_accepted_after_validation() {
+        use crate::transport::inmemory::create_cluster_with_timeout;
+
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        let core1 = new_validating_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let config = RaftConfig::default()
+            .with_election_timeout(Duration::from_secs(100), Duration::from_secs(100));
+
+        let (server1, shared1, ) = RaftServer::with_config(core1, transport1, config);
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        // Win election
+        server1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        let client_handle = server1.start();
+
+        // Submit valid command
+        let submit_task = tokio::spawn({
+            let handle = client_handle.clone();
+            async move {
+                handle.submit("VALID command".to_string()).await
+            }
+        });
+
+        // Spawn peer handlers
+        let shared2_clone = shared2.clone();
+        let shared3_clone = shared3.clone();
+        tokio::spawn(async move {
+            tokio::join!(
+                handle2.process_one_shared(&shared2_clone),
+                handle3.process_one_shared(&shared3_clone),
+            );
+        });
+
+        // Advance time
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+
+        let result = submit_task.await.unwrap();
+
+        // Should succeed
+        assert!(result.is_ok());
+
+        // Log should have NOOP + valid command
+        assert_eq!(shared1.lock().await.log.len(), 2);
+        assert_eq!(shared1.lock().await.log[1].command, "VALID command");
     }
 }

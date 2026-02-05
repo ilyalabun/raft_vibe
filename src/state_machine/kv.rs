@@ -42,6 +42,10 @@ impl KeyValueStore {
 pub type SharedKvStore = Arc<Mutex<KeyValueStore>>;
 
 impl StateMachine for SharedKvStore {
+    fn validate(&self, command: &str) -> Result<(), String> {
+        self.lock().unwrap().validate(command)
+    }
+
     fn apply(&mut self, command: &str) -> ApplyResult {
         self.lock().unwrap().apply(command)
     }
@@ -58,6 +62,21 @@ impl Snapshotable for SharedKvStore {
 }
 
 impl StateMachine for KeyValueStore {
+    fn validate(&self, command: &str) -> Result<(), String> {
+        // No-op command is always valid
+        if command == NOOP_COMMAND {
+            return Ok(());
+        }
+
+        let parts: Vec<&str> = command.splitn(3, ' ').collect();
+
+        match parts.as_slice() {
+            ["SET", _key, _value] => Ok(()),
+            ["DELETE", _key] => Ok(()),
+            _ => Err(format!("unknown command: {}", command)),
+        }
+    }
+
     fn apply(&mut self, command: &str) -> ApplyResult {
         // Handle no-op command (used by leader on election)
         if command == NOOP_COMMAND {
@@ -222,5 +241,42 @@ mod tests {
         let result = kv.restore(b"invalid json data");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("deserialization failed"));
+    }
+
+    #[test]
+    fn test_validate_set_command() {
+        let kv = KeyValueStore::new();
+        assert!(kv.validate("SET foo bar").is_ok());
+        assert!(kv.validate("SET key value with spaces").is_ok());
+    }
+
+    #[test]
+    fn test_validate_delete_command() {
+        let kv = KeyValueStore::new();
+        assert!(kv.validate("DELETE foo").is_ok());
+    }
+
+    #[test]
+    fn test_validate_noop_command() {
+        let kv = KeyValueStore::new();
+        assert!(kv.validate(NOOP_COMMAND).is_ok());
+    }
+
+    #[test]
+    fn test_validate_invalid_command() {
+        let kv = KeyValueStore::new();
+
+        // Unknown command
+        let result = kv.validate("INVALID foo");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown command"));
+
+        // SET without value
+        let result = kv.validate("SET foo");
+        assert!(result.is_err());
+
+        // Empty command
+        let result = kv.validate("");
+        assert!(result.is_err());
     }
 }

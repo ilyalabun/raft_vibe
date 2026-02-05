@@ -14,6 +14,10 @@ pub type ApplyResult = Result<String, String>;
 /// Implementations must be deterministic: applying the same commands
 /// in the same order must produce the same state on all nodes.
 pub trait StateMachine: Send {
+    /// Validate a command before appending to the log
+    /// Returns Ok(()) if valid, Err(message) if invalid
+    fn validate(&self, command: &str) -> Result<(), String>;
+
     /// Apply a command to the state machine
     /// Returns Ok(output) on success, Err(message) on error
     fn apply(&mut self, command: &str) -> ApplyResult;
@@ -55,6 +59,10 @@ impl TestStateMachine {
 }
 
 impl StateMachine for TestStateMachine {
+    fn validate(&self, _command: &str) -> Result<(), String> {
+        Ok(()) // Test state machine accepts all commands
+    }
+
     fn apply(&mut self, command: &str) -> ApplyResult {
         self.applied.lock().unwrap().push(command.to_string());
         Ok(String::new())

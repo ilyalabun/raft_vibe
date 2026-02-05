@@ -183,6 +183,13 @@ pub async fn handle_submit(
                 leader_hint: None,
             }),
         )),
+        Err(RaftError::InvalidCommand(err)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Invalid command: {}", err),
+                leader_hint: None,
+            }),
+        )),
         Err(RaftError::StateMachine(err)) => Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -227,6 +234,13 @@ async fn handle_kv_set(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
                 error: "Entry not committed (couldn't reach majority)".to_string(),
+                leader_hint: None,
+            }),
+        )),
+        Err(RaftError::InvalidCommand(err)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Invalid command: {}", err),
                 leader_hint: None,
             }),
         )),
@@ -316,6 +330,13 @@ async fn handle_kv_delete(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
                 error: "Entry not committed (couldn't reach majority)".to_string(),
+                leader_hint: None,
+            }),
+        )),
+        Err(RaftError::InvalidCommand(err)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Invalid command: {}", err),
                 leader_hint: None,
             }),
         )),
@@ -625,5 +646,107 @@ mod tests {
         // Verify entry was committed (NOOP at index 1 + command at index 2)
         assert_eq!(shared1.lock().await.commit_index, 2);
         assert_eq!(shared1.lock().await.last_applied, 2);
+    }
+
+    // === Command Validation Tests ===
+
+    /// Test state machine that rejects commands starting with "INVALID"
+    struct ValidatingStateMachine;
+
+    impl crate::state_machine::StateMachine for ValidatingStateMachine {
+        fn validate(&self, command: &str) -> Result<(), String> {
+            if command.starts_with("INVALID") {
+                Err(format!("rejected: {}", command))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn apply(&mut self, _command: &str) -> crate::state_machine::ApplyResult {
+            Ok(String::new())
+        }
+    }
+
+    impl crate::state_machine::Snapshotable for ValidatingStateMachine {
+        fn snapshot(&self) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+
+        fn restore(&mut self, _data: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn new_validating_core(id: u64, peers: Vec<u64>) -> RaftCore {
+        RaftCore::new(
+            id,
+            peers,
+            Box::new(MemoryStorage::new()),
+            Box::new(ValidatingStateMachine),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_submit_invalid_command_returns_bad_request() {
+        let node_ids = vec![1, 2, 3];
+        let timeout = Duration::from_millis(100);
+        let (mut transports, mut handles) = create_cluster_with_timeout(&node_ids, Some(timeout));
+
+        let core1 = new_validating_core(1, vec![2, 3]);
+        let core2 = new_test_core(2, vec![1, 3]);
+        let core3 = new_test_core(3, vec![1, 2]);
+
+        let transport1 = transports.remove(&1).unwrap();
+
+        let mut handle2 = handles.remove(&2).unwrap();
+        let mut handle3 = handles.remove(&3).unwrap();
+
+        let shared2 = Arc::new(Mutex::new(core2));
+        let shared3 = Arc::new(Mutex::new(core3));
+
+        let (server1, shared1) = RaftServer::new(core1, transport1);
+
+        // Win election
+        server1.start_election().await;
+        let (_, _, _) = tokio::join!(
+            server1.request_votes(),
+            handle2.process_one_shared(&shared2),
+            handle3.process_one_shared(&shared3),
+        );
+        assert_eq!(server1.state().await, RaftState::Leader);
+
+        let raft_handle1 = server1.start();
+        let app = create_client_router_full(raft_handle1, shared1.clone());
+
+        // Submit invalid command via HTTP
+        let request = Request::builder()
+            .method("POST")
+            .uri("/client/submit")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"command": "INVALID command"}"#))
+            .unwrap();
+
+        let response_task = tokio::spawn(async move {
+            app.oneshot(request).await
+        });
+
+        // Advance time
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+
+        let response = response_task.await.unwrap().unwrap();
+
+        // Should return 400 Bad Request
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert!(error.error.contains("Invalid command"));
+        assert!(error.error.contains("INVALID"));
+
+        // Log should only have NOOP (invalid command was not appended)
+        assert_eq!(shared1.lock().await.log.len(), 1);
     }
 }

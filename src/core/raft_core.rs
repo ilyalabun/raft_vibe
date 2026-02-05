@@ -623,6 +623,12 @@ impl RaftCore {
         self.persist_log_entry(noop_entry);
     }
 
+    /// Validate a command using the state machine
+    /// Returns Ok(()) if the command is valid, Err(message) otherwise
+    pub fn validate_command(&self, command: &str) -> Result<(), String> {
+        self.state_machine.validate(command)
+    }
+
     /// Add a new log entry (called by leader when receiving client request)
     /// Returns None if called on a non-leader node
     pub fn append_log_entry(&mut self, command: String) -> Option<LogEntry> {
