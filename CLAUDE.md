@@ -108,6 +108,7 @@ let leader = cluster.wait_for_leader(Duration::from_secs(10)).await;
 - Run tests after each change
 - Always run tests wrapped with `timeout 30`
 - Always fix Rust warnings (don't use `#[allow(dead_code)]`)
+- Don't mention Claude in commit messages
 - Update README.md after changes to architecture or project structure
 - Document changes in LOG.md:
   ```markdown
