@@ -63,14 +63,62 @@ impl LinearizabilityChecker {
     ///
     /// Uses the Wing-Gong algorithm:
     /// 1. Filter to only successful operations
-    /// 2. Recursive search with backtracking
-    /// 3. Track the "frontier" - earliest time at which next op can linearize
+    /// 2. Quick check: all read values must have been written (or be None/initial)
+    /// 3. Recursive search with backtracking
+    /// 4. Track the "frontier" - earliest time at which next op can linearize
     pub fn check(history: &History) -> CheckResult {
         // Get only successful operations
         let ops: Vec<_> = history.successful_ops();
 
         if ops.is_empty() {
             return CheckResult::linearizable(vec![]);
+        }
+
+        // Fast check: collect all written values and verify reads only return those values
+        let mut written_values: std::collections::HashSet<Option<String>> =
+            std::collections::HashSet::new();
+        written_values.insert(None); // Initial state
+
+        for op in &ops {
+            if let OpKind::Write { value } = &op.kind {
+                written_values.insert(Some(value.clone()));
+            }
+        }
+
+        for op in &ops {
+            if let (OpKind::Read, OpResult::ReadOk(read_value)) = (&op.kind, &op.result) {
+                if !written_values.contains(read_value) {
+                    return CheckResult::not_linearizable(format!(
+                        "Read returned value {:?} which was never written",
+                        read_value
+                    ));
+                }
+            }
+        }
+
+        // Fast check for obvious stale reads:
+        // If a read returns None (initial state) but started after any write completed,
+        // and no later writes could have "undone" the value, it's a stale read.
+        // (For a single-key register without DELETE, once written, reading None is stale)
+        for read_op in &ops {
+            if let (OpKind::Read, OpResult::ReadOk(None)) = (&read_op.kind, &read_op.result) {
+                // Check if any write completed before this read started
+                for write_op in &ops {
+                    if let OpKind::Write { value } = &write_op.kind {
+                        // Write completed before read started - read should not see None
+                        if write_op.complete_ts.0 < read_op.invoke_ts.0 {
+                            // Check if there's any way the read could validly see None:
+                            // Only if there's a concurrent write that could linearize before
+                            // the first write. But if the write completed, it must linearize
+                            // before its complete_ts.
+                            return CheckResult::not_linearizable(format!(
+                                "Stale read: Read started at {} returned None, but write of {:?} completed at {}",
+                                read_op.invoke_ts.0, value, write_op.complete_ts.0
+                            ));
+                        }
+                    }
+                }
+            }
         }
 
         // Build list of remaining operations (indices into ops)

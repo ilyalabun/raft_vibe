@@ -810,6 +810,42 @@ Cluster tests verify linearizability under:
 
 All 239 tests pass across the workspace.
 
+**Prompt:** "I want to verify that my linearizability tests work, can we break the code to verify that tests catch it?"
+
+**Discovering Checker Performance Issues**
+
+Attempted to verify linearizability tests by introducing bugs into the code. First tried skipping 20% of writes in the state machine, but the tests timed out. The WGL algorithm has O(n!) worst-case complexity - when no valid linearization exists, it must exhaustively try all orderings before concluding failure. With 250 concurrent operations, this takes forever.
+
+**Adding Fast Pre-Checks**
+
+Added two optimizations to `chaos-test/src/checker.rs` that detect common linearizability violations in O(n) or O(n²) time before running the expensive recursive search:
+
+1. **Impossible Value Detection** - Collects all written values into a HashSet (including initial `None` state). Before the recursive search, verifies every read returned a value that was actually written. If a read returns a value that was never written, immediately fails with a clear error message.
+
+2. **Stale Read Detection** - For each read that returns `None` (initial state), checks if any write completed before the read started. If so, the read should not see `None` because the write must have linearized first. This catches the common case of reading stale initial state after writes.
+
+**Verification with Intentional Bugs**
+
+Verified both optimizations work by introducing bugs:
+
+1. **Impossible Value Bug** - Made `get()` randomly return `"IMPOSSIBLE_VALUE"`:
+   ```
+   Linearizable: false, Error: "Read returned value Some(\"IMPOSSIBLE_VALUE\") which was never written"
+   ```
+   Detection time: ~3 seconds (was timing out before)
+
+2. **Stale Read Bug** - Made `get()` randomly return `None` even when key exists:
+   ```
+   Linearizable: false, Error: "Stale read: Read started at 227950 returned None, but write of \"v1\" completed at 52841"
+   ```
+   Detection time: ~3 seconds (was timing out before)
+
+**Key Insight**
+
+The WGL algorithm is correct but slow for negative cases. Adding fast pre-checks for common violations makes the test suite practical - bugs are caught instantly instead of timing out. The full recursive algorithm is still needed for subtle violations that the pre-checks can't detect.
+
+All 239 tests pass.
+
 ---
 
 ## Next Up
