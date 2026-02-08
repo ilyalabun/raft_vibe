@@ -7,3 +7,6 @@ pub mod core;
 pub mod state_machine;
 pub mod storage;
 pub mod transport;
+
+/// Testing utilities for integration tests.
+pub mod testing;

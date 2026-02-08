@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "chaos-test"]
+
 [package]
 name = "raft_vibe"
 version = "0.1.0"
@@ -17,7 +20,11 @@ serde_json = "1"
 axum = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+[features]
+testing = []
+
 [dev-dependencies]
 tempfile = "3"
 tower = "0.5"
 http-body-util = "0.1"
+chaos-test = { path = "chaos-test" }

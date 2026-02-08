@@ -3,239 +3,11 @@
 //! These tests spin up actual HTTP servers (a 3-node cluster) and test
 //! concurrent client requests over real HTTP/TCP connections.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
-
-use raft_vibe::api::client_http::{
-    create_client_router_with_reads, ErrorResponse, KvGetResponse, KvMutationResponse,
-    LeaderResponse, StatusResponse,
-};
-use raft_vibe::core::config::RaftConfig;
-use raft_vibe::core::raft_core::RaftCore;
-use raft_vibe::core::raft_server::RaftServer;
-use raft_vibe::state_machine::kv::{KeyValueStore, SharedKvStore};
-use raft_vibe::storage::memory::MemoryStorage;
-use raft_vibe::transport::http::{create_router, HttpTransport, SharedCore};
-
-use axum::Router;
-
-/// A single test node in the cluster
-struct TestNode {
-    #[allow(dead_code)]
-    id: u64,
-    addr: SocketAddr,
-    http_shutdown_tx: Option<oneshot::Sender<()>>,
-    raft_handle: raft_vibe::core::raft_server::RaftHandle,
-    #[allow(dead_code)]
-    kv_store: SharedKvStore,
-    shared_core: SharedCore,
-}
-
-impl TestNode {
-    fn addr(&self) -> SocketAddr {
-        self.addr
-    }
-}
-
-/// A test cluster of 3 Raft nodes
-struct TestCluster {
-    nodes: Vec<TestNode>,
-}
-
-impl TestCluster {
-    /// Create and start a new 3-node cluster
-    async fn new() -> Self {
-        Self::with_nodes(3).await
-    }
-
-    /// Create and start a cluster with the specified number of nodes
-    async fn with_nodes(count: usize) -> Self {
-        let node_ids: Vec<u64> = (1..=count as u64).collect();
-
-        // First, bind all listeners to get addresses
-        let mut listeners = Vec::new();
-        let mut addrs = HashMap::new();
-
-        for &id in &node_ids {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            addrs.insert(id, addr.to_string());
-            listeners.push((id, listener, addr));
-        }
-
-        // Use faster election timeouts for testing
-        let config = RaftConfig::default()
-            .with_heartbeat_interval(Duration::from_millis(50))
-            .with_election_timeout(Duration::from_millis(150), Duration::from_millis(300));
-
-        // Now start each node
-        let mut nodes = Vec::new();
-
-        for (id, listener, addr) in listeners {
-            // Build peer map (all nodes except self)
-            let peers: HashMap<u64, String> = addrs
-                .iter()
-                .filter(|(&peer_id, _)| peer_id != id)
-                .map(|(&peer_id, addr)| (peer_id, addr.clone()))
-                .collect();
-
-            let peer_ids: Vec<u64> = peers.keys().copied().collect();
-
-            // Create state machine
-            let kv_store: SharedKvStore = Arc::new(Mutex::new(KeyValueStore::new()));
-
-            // Create transport with shorter timeout for tests
-            let transport = HttpTransport::new(peers, Duration::from_secs(2));
-
-            // Create RaftCore
-            let core = RaftCore::new(
-                id,
-                peer_ids,
-                Box::new(MemoryStorage::new()),
-                Box::new(kv_store.clone()),
-            );
-
-            // Create RaftServer with test config
-            let (server, shared_core) = RaftServer::with_config(core, transport, config.clone());
-
-            // Start the server loop
-            let raft_handle = server.start();
-
-            // Clone shared_core for TestNode before passing to create_combined_router
-            let node_shared_core = shared_core.clone();
-
-            // Create combined router (clone handle for the router)
-            let app = create_combined_router(shared_core.clone(), raft_handle.clone(), shared_core, kv_store.clone());
-
-            // Create HTTP shutdown channel
-            let (http_shutdown_tx, http_shutdown_rx) = oneshot::channel();
-
-            // Spawn the HTTP server with graceful shutdown
-            tokio::spawn(async move {
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async {
-                        let _ = http_shutdown_rx.await;
-                    })
-                    .await
-                    .unwrap();
-            });
-
-            nodes.push(TestNode {
-                id,
-                addr,
-                http_shutdown_tx: Some(http_shutdown_tx),
-                raft_handle,
-                kv_store,
-                shared_core: node_shared_core,
-            });
-        }
-
-        // Give servers time to start
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        TestCluster { nodes }
-    }
-
-    /// Shutdown all nodes gracefully
-    async fn shutdown(mut self) {
-        for node in &mut self.nodes {
-            // Shutdown HTTP server
-            if let Some(tx) = node.http_shutdown_tx.take() {
-                let _ = tx.send(());
-            }
-            // Shutdown RaftServer
-            node.raft_handle.shutdown().await;
-        }
-        // Give servers time to shutdown
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    /// Get address of a specific node
-    #[allow(dead_code)]
-    fn node_addr(&self, index: usize) -> SocketAddr {
-        self.nodes[index].addr()
-    }
-
-    /// Get all node addresses
-    fn all_addrs(&self) -> Vec<SocketAddr> {
-        self.nodes.iter().map(|n| n.addr()).collect()
-    }
-
-    /// Wait for a leader to be elected, with timeout
-    async fn wait_for_leader(&self, timeout: Duration) -> Option<SocketAddr> {
-        let start = std::time::Instant::now();
-        // Use a client with short timeout to avoid getting stuck on shutdown nodes
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(500))
-            .build()
-            .unwrap();
-
-        while start.elapsed() < timeout {
-            for node in &self.nodes {
-                // Skip nodes that have been shut down (HTTP server)
-                if node.http_shutdown_tx.is_none() {
-                    continue;
-                }
-                if let Ok(status) = get_status(&client, &node.addr).await {
-                    if status.state == "Leader" {
-                        return Some(node.addr);
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        None
-    }
-
-    /// Find current leader address
-    #[allow(dead_code)]
-    async fn find_leader(&self) -> Option<SocketAddr> {
-        let client = reqwest::Client::new();
-        for node in &self.nodes {
-            if let Ok(status) = get_status(&client, &node.addr).await {
-                if status.state == "Leader" {
-                    return Some(node.addr);
-                }
-            }
-        }
-        None
-    }
-
-    /// Get kv_store for a node
-    #[allow(dead_code)]
-    fn kv_store(&self, index: usize) -> SharedKvStore {
-        self.nodes[index].kv_store.clone()
-    }
-
-    /// Find a follower address
-    async fn find_follower(&self) -> Option<SocketAddr> {
-        let client = reqwest::Client::new();
-        for node in &self.nodes {
-            if let Ok(status) = get_status(&client, &node.addr).await {
-                if status.state == "Follower" {
-                    return Some(node.addr);
-                }
-            }
-        }
-        None
-    }
-
-    /// Shutdown a specific node (both HTTP and Raft servers)
-    async fn shutdown_node(&mut self, index: usize) {
-        // Shutdown HTTP server
-        if let Some(tx) = self.nodes[index].http_shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-        // Shutdown RaftServer
-        self.nodes[index].raft_handle.shutdown().await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
+use raft_vibe::api::client_http::{ErrorResponse, KvGetResponse, KvMutationResponse, StatusResponse};
+use raft_vibe::testing::TestCluster;
 
 // HTTP client helpers
 
@@ -251,19 +23,6 @@ async fn get_status(
         .await
 }
 
-#[allow(dead_code)]
-async fn get_leader(
-    client: &reqwest::Client,
-    addr: &SocketAddr,
-) -> Result<LeaderResponse, reqwest::Error> {
-    client
-        .get(format!("http://{}/client/leader", addr))
-        .send()
-        .await?
-        .json()
-        .await
-}
-
 /// Submit a SET command via the RESTful KV API
 async fn submit_command(
     client: &reqwest::Client,
@@ -273,7 +32,10 @@ async fn submit_command(
     // Parse command to extract key and value (format: "SET key value")
     let parts: Vec<&str> = command.splitn(3, ' ').collect();
     if parts.len() < 3 || parts[0] != "SET" {
-        return Err(SubmitError::Network(format!("Invalid command format: {}", command)));
+        return Err(SubmitError::Network(format!(
+            "Invalid command format: {}",
+            command
+        )));
     }
     let key = parts[1];
     let value = parts[2];
@@ -351,20 +113,6 @@ enum SubmitError {
         message: String,
         leader_hint: Option<u64>,
     },
-}
-
-// Router creation
-
-fn create_combined_router(
-    raft_core: SharedCore,
-    raft_handle: raft_vibe::core::raft_server::RaftHandle,
-    client_core: SharedCore,
-    kv_store: SharedKvStore,
-) -> Router {
-    let raft_router = create_router(raft_core);
-    let client_router = create_client_router_with_reads(raft_handle, client_core, kv_store);
-
-    raft_router.merge(client_router)
 }
 
 // Test cases
@@ -594,7 +342,10 @@ async fn test_follower_redirect() {
     let result = submit_command(&client, &follower_addr, "SET foo bar").await;
 
     match result {
-        Err(SubmitError::NotLeader { message, leader_hint }) => {
+        Err(SubmitError::NotLeader {
+            message,
+            leader_hint,
+        }) => {
             assert_eq!(message, "Not the leader");
             assert!(
                 leader_hint.is_some(),
@@ -636,7 +387,7 @@ async fn test_leader_failover() {
     let leader_index = cluster
         .nodes
         .iter()
-        .position(|n| n.addr == leader_addr)
+        .position(|n| n.addr() == leader_addr)
         .unwrap();
 
     // Kill the leader
@@ -691,22 +442,18 @@ async fn test_concurrent_commands_during_leader_failover() {
     let leader_index = cluster
         .nodes
         .iter()
-        .position(|n| n.addr == leader_addr)
+        .position(|n| n.addr() == leader_addr)
         .unwrap();
-
-    // Get remaining node addresses (not the leader)
-    let _remaining_addrs: Vec<_> = cluster
-        .all_addrs()
-        .into_iter()
-        .filter(|&addr| addr != leader_addr)
-        .collect();
 
     // Kill the leader
     cluster.shutdown_node(leader_index).await;
 
     // Wait for new leader to be elected
     let new_leader = cluster.wait_for_leader(Duration::from_secs(10)).await;
-    assert!(new_leader.is_some(), "New leader should be elected after failover");
+    assert!(
+        new_leader.is_some(),
+        "New leader should be elected after failover"
+    );
 
     let new_leader_addr = new_leader.unwrap();
 
@@ -714,7 +461,10 @@ async fn test_concurrent_commands_during_leader_failover() {
     let mut successes = 0;
     for i in 5..10 {
         let cmd = format!("SET failover{} value{}", i, i);
-        if submit_command(&client, &new_leader_addr, &cmd).await.is_ok() {
+        if submit_command(&client, &new_leader_addr, &cmd)
+            .await
+            .is_ok()
+        {
             successes += 1;
         }
     }
@@ -726,7 +476,10 @@ async fn test_concurrent_commands_during_leader_failover() {
     let mut read_count = 0;
     for i in 0..5 {
         let key = format!("failover{}", i);
-        if linearizable_read(&client, &new_leader_addr, &key).await.is_ok() {
+        if linearizable_read(&client, &new_leader_addr, &key)
+            .await
+            .is_ok()
+        {
             read_count += 1;
         }
     }
@@ -854,7 +607,9 @@ async fn test_concurrent_writes_to_same_key() {
             .expect("Should have SET prefix");
 
         // The state machine should have this exact value
-        let sm_value = kv.get("contested_key").expect("Key should exist in state machine");
+        let sm_value = kv
+            .get("contested_key")
+            .expect("Key should exist in state machine");
         assert_eq!(
             sm_value, last_log_value,
             "State machine value '{}' should match last log entry value '{}'",
@@ -922,7 +677,10 @@ async fn test_linearizable_read_not_leader() {
     let result = linearizable_read(&client, &follower_addr, "anykey").await;
 
     match result {
-        Err(ReadError::NotLeader { message, leader_hint }) => {
+        Err(ReadError::NotLeader {
+            message,
+            leader_hint,
+        }) => {
             assert_eq!(message, "Not the leader");
             assert!(
                 leader_hint.is_some(),

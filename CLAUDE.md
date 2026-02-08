@@ -9,11 +9,13 @@ Educational implementation of the Raft consensus protocol in Rust, built through
 ## Build & Test Commands
 
 ```bash
-cargo build                    # Build the project
-cargo build --release          # Build for release
-cargo test                     # Run all tests
-cargo test <test_name>         # Run a single test
-cargo test -- --nocapture      # Run tests with stdout visible
+cargo build                              # Build the project
+cargo test                               # Run all tests
+cargo test <test_name>                   # Run a single test
+cargo test -- --nocapture                # Run tests with stdout visible
+cargo test --test http_cluster           # Run HTTP integration tests
+cargo test --test linearizability_test   # Run linearizability tests
+cargo test --package chaos-test          # Run chaos-test crate tests only
 ```
 
 Run cluster locally:
@@ -21,6 +23,9 @@ Run cluster locally:
 ./run_cluster.sh start         # Start 3-node cluster
 ./run_cluster.sh status        # Check cluster status
 ./run_cluster.sh stop          # Stop cluster
+./run_cluster.sh killnode 1    # Kill node 1 to test failover
+./run_cluster.sh startnode 1   # Restart node 1
+./run_cluster.sh watchlogs     # Tail all logs with colored output
 ```
 
 ## Architecture
@@ -31,9 +36,10 @@ Layered architecture separating core Raft logic from async networking:
 Synchronous, transport-agnostic Raft state machine:
 - Persistent state: `current_term`, `voted_for`, `log`
 - Volatile state: `commit_index`, `last_applied`, `next_index`, `match_index`
-- RPC handlers: `handle_request_vote()`, `handle_append_entries()`
+- RPC handlers: `handle_request_vote()`, `handle_append_entries()`, `handle_install_snapshot()`
 - Election: `start_election()`, `become_leader()`, `handle_request_vote_result()`
 - Replication: `append_log_entry()`, `handle_append_entries_result()`
+- Snapshotting: `take_snapshot()`, log compaction
 
 ### Layer 2: Transport (`src/transport/`)
 Async trait abstraction (`traits.rs`) for network communication:
@@ -45,22 +51,31 @@ High-level async operations combining RaftCore with Transport:
 - Wraps `RaftCore` in `Arc<Mutex<_>>` for concurrent access
 - `request_votes()` - Send vote requests to all peers concurrently
 - `replicate_to_peers()` - Replicate entries to all peers
+- `send_heartbeat()` - Send heartbeats (may include InstallSnapshot for far-behind followers)
 
 ### Layer 4: RaftServer (`src/core/raft_server.rs`)
 Event-driven server loop with timeouts:
 - Election timeout with randomization (300-500ms default)
 - Heartbeat interval (150ms default)
 - Client command handling via `RaftHandle`
+- ReadIndex for linearizable reads
 
 ### Storage (`src/storage/`)
 Pluggable persistence: `FileStorage` for production, `MemoryStorage` for tests.
 
 ### State Machine (`src/state_machine/`)
-Pluggable state machines via trait. Includes `KeyValueStore` implementation.
+Pluggable state machines via trait. Includes `KeyValueStore` with `validate()` for pre-append command validation.
+
+### Chaos Testing (`chaos-test/`)
+Jepsen-like linearizability testing framework:
+- WGL (Wing-Gong Linearizability) checker in `checker.rs`
+- HTTP test client recording operations with timestamps in `client.rs`
+- Test runner orchestrating concurrent clients in `runner.rs`
+- `TestCluster` helper in `src/testing.rs` for spinning up test clusters
 
 ## Key Design Patterns
 
-1. **Event-based timeout reset**: `handle_append_entries()` returns `RaftEvent::ResetElectionTimeout` to signal the server layer should reset its election timer.
+1. **Timeout reset via last_heartbeat**: `handle_append_entries()` updates `last_heartbeat = Instant::now()`. The server checks `has_election_timed_out()` to decide when to start elections.
 
 2. **Lock discipline**: RaftNode releases the core lock before network I/O, reacquires to process responses.
 
@@ -68,7 +83,9 @@ Pluggable state machines via trait. Includes `KeyValueStore` implementation.
 
 4. **Deterministic time testing**: Tests use `#[tokio::test(start_paused = true)]` with `tokio::time::advance()`.
 
-## Testing Pattern
+5. **Log indexing with snapshots**: After snapshot at index S, `log[0]` contains entry S+1. Use `get_log_entry(index)` helper which accounts for `snapshot_last_index` offset.
+
+## Testing Patterns
 
 In-memory transport requires explicit request processing:
 ```rust
@@ -77,6 +94,12 @@ let (became_leader, _, _) = tokio::join!(
     handle2.process_one_shared(&shared2),
     handle3.process_one_shared(&shared3),
 );
+```
+
+For HTTP cluster tests, use `TestCluster` from `raft_vibe::testing`:
+```rust
+let cluster = TestCluster::new().await;
+let leader = cluster.wait_for_leader(Duration::from_secs(10)).await;
 ```
 
 ## Important Rules

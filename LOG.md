@@ -721,6 +721,97 @@ All 199 tests pass.
 
 ---
 
+## Day 15: Jepsen-like Linearizability Testing Framework
+
+**Prompt:** "Implement the following plan: Jepsen-like Test Framework: `chaos-test` Crate"
+
+**Creating the chaos-test Crate**
+
+Created a new workspace member crate `chaos-test` providing Jepsen-like testing capabilities for the Raft cluster. The framework verifies linearizability under concurrent operations using the Wing-Gong Linearizability (WGL) algorithm implemented from scratch.
+
+**History Types**
+
+Created `history.rs` with types for recording concurrent operations:
+- `Timestamp` - Microseconds since test start
+- `ClientId` - Client identifier wrapper
+- `OpKind` - Read or Write{value}
+- `OpResult` - ReadOk(Option<String>), WriteOk, Error(String)
+- `Operation` - Complete operation with id, client, kind, timestamps, result
+- `History` - Collection with `now()` method for timestamp generation
+
+**WGL Linearizability Checker**
+
+Implemented the WGL algorithm in `checker.rs`. The algorithm works by:
+1. Building a list of operations sorted by invoke time
+2. Recursive search with backtracking to find valid linearization
+3. For each candidate operation, apply to model (write updates value, read checks value matches)
+4. Backtrack if no valid linearization found
+
+Key insight: The algorithm tracks a "frontier" (earliest time next op can linearize) and checks `complete_ts >= frontier` for candidates. This correctly handles concurrent operations where an op with later invoke_ts can linearize before one with earlier invoke_ts.
+
+**Test Client**
+
+Created `client.rs` with an HTTP test client that records operations to a shared History:
+- Records `invoke_ts` before HTTP request
+- Sends request to `/kv/:key` endpoints (GET for read, POST for write)
+- Handles leader redirection (follows 503 responses with leader_hint)
+- Records `complete_ts` after response
+- Adds completed Operation to shared History
+
+**Test Runner**
+
+Created `runner.rs` with test orchestration:
+- `TestConfig` with node addresses, client count, ops per client, key, write ratio
+- Spawns concurrent client tasks using `StdRng::from_os_rng()` (Send-safe RNG for async)
+- Each client performs random read/write operations
+- Runs linearizability checker on collected history
+
+**Extracting TestCluster**
+
+Moved `TestCluster` from `tests/http_cluster.rs` to `src/testing.rs` in raft_vibe for reuse by the linearizability tests. Updated `tests/http_cluster.rs` to import from `raft_vibe::testing::TestCluster`.
+
+**Prompt:** "let's separate test harness tests from chaos tests themselves"
+
+**Test Organization**
+
+Separated WGL checker unit tests from cluster integration tests:
+- `chaos-test/tests/checker_test.rs` - 12 unit tests for the WGL checker itself
+- `tests/linearizability_test.rs` - 4 integration tests against real 3-node cluster
+
+**Prompt:** "can we move chaos tests to `tests/` next to http_cluster.rs"
+
+**Moving Cluster Tests**
+
+Moved cluster linearizability tests from chaos-test crate to main raft_vibe tests directory. Added `chaos-test` as a dev-dependency of raft_vibe. The linearizability tests now live alongside other integration tests in `tests/linearizability_test.rs`.
+
+**Bug Fixes**
+
+1. **ThreadRng not Send** - `rand::rng()` returns ThreadRng which is not Send. Fixed by using `StdRng::from_os_rng()` with `SeedableRng` trait for async-safe random number generation.
+
+2. **WGL checker too restrictive** - The initial algorithm used minimum invoke_ts as current_time, preventing operations with later invoke_ts from linearizing first. Fixed by tracking a "frontier" and checking `complete_ts >= frontier` for candidates.
+
+**Test Coverage**
+
+WGL Checker tests verify:
+- Sequential operations linearize correctly
+- Stale reads are rejected
+- Concurrent operations find valid orderings
+- Impossible read values are detected
+- Failed operations are filtered
+- Empty history is trivially linearizable
+- Reads during overlapping writes can see old or new value
+- Many concurrent writes with final read
+
+Cluster tests verify linearizability under:
+- Healthy cluster (5 clients × 50 ops)
+- High concurrency (10 clients × 20 ops)
+- Write-heavy workload (80% writes)
+- Read-heavy workload (80% reads)
+
+All 239 tests pass across the workspace.
+
+---
+
 ## Next Up
 
 - Potential future work: Dynamic cluster membership, cluster configuration changes

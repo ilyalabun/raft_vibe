@@ -186,8 +186,56 @@ src/
 │   └── kv.rs               # Key-value store implementation
 ├── api/
 │   └── client_http.rs      # HTTP API for clients
+├── testing.rs              # Test utilities (TestCluster)
 └── lib.rs                  # Library exports
+
+chaos-test/                   # Linearizability testing framework
+├── src/
+│   ├── lib.rs              # Public API exports
+│   ├── history.rs          # Operation history types
+│   ├── checker.rs          # WGL linearizability checker
+│   ├── client.rs           # HTTP test client
+│   └── runner.rs           # Test orchestration
+└── tests/
+    └── checker_test.rs     # WGL checker unit tests
 ```
+
+## Linearizability Testing
+
+The project includes a Jepsen-like testing framework (`chaos-test` crate) that verifies the cluster maintains linearizability under concurrent operations.
+
+### What is Linearizability?
+
+Linearizability is the strongest consistency guarantee: every operation appears to take effect instantaneously at some point between its invocation and response. For a key-value store, this means concurrent clients always see a consistent ordering of reads and writes.
+
+### Running Linearizability Tests
+
+```bash
+# Run all linearizability tests against a real cluster
+cargo test --test linearizability_test
+
+# Run WGL checker unit tests
+cargo test --package chaos-test
+```
+
+### The WGL Checker
+
+The `chaos-test` crate implements the Wing-Gong Linearizability (WGL) algorithm from scratch. It works by:
+
+1. Recording all client operations with microsecond timestamps (invoke and complete times)
+2. Finding a valid linearization - an ordering where each operation could have taken effect atomically
+3. Verifying reads return values consistent with the write ordering
+
+The checker handles concurrent operations by exploring all valid orderings where operations overlap in time.
+
+### Test Workloads
+
+The linearizability tests spin up a 3-node cluster and run concurrent clients performing reads and writes:
+
+- `test_healthy_cluster` - 5 clients, 50 ops each, 50% writes
+- `test_high_concurrency` - 10 clients, 20 ops each, stress test
+- `test_write_heavy` - 80% writes, stress write ordering
+- `test_read_heavy` - 80% reads, stress read consistency
 
 ## Resources
 
