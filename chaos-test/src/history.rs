@@ -59,6 +59,8 @@ pub struct Operation {
     pub id: u64,
     /// Client that performed the operation
     pub client_id: ClientId,
+    /// Key this operation targets
+    pub key: String,
     /// Type of operation (read or write)
     pub kind: OpKind,
     /// When operation started (invocation time)
@@ -74,6 +76,7 @@ impl Operation {
     pub fn new(
         id: u64,
         client_id: ClientId,
+        key: String,
         kind: OpKind,
         invoke_ts: Timestamp,
         complete_ts: Timestamp,
@@ -82,6 +85,7 @@ impl Operation {
         Operation {
             id,
             client_id,
+            key,
             kind,
             invoke_ts,
             complete_ts,
@@ -176,6 +180,16 @@ impl History {
             .filter(|op| !matches!(op.result, OpResult::Error(_)))
             .collect()
     }
+
+    /// Get operations for a specific key
+    pub fn ops_for_key(&self, key: &str) -> Vec<&Operation> {
+        self.ops.iter().filter(|op| op.key == key).collect()
+    }
+
+    /// Get unique keys from all operations
+    pub fn unique_keys(&self) -> std::collections::HashSet<&str> {
+        self.ops.iter().map(|op| op.key.as_str()).collect()
+    }
 }
 
 #[cfg(test)]
@@ -196,6 +210,7 @@ mod tests {
         let op1 = Operation::new(
             1,
             ClientId(1),
+            "x".to_string(),
             OpKind::Write {
                 value: "a".to_string(),
             },
@@ -208,6 +223,7 @@ mod tests {
         let op2 = Operation::new(
             2,
             ClientId(2),
+            "x".to_string(),
             OpKind::Read,
             Timestamp(200),
             Timestamp(400),
@@ -218,6 +234,7 @@ mod tests {
         let op3 = Operation::new(
             3,
             ClientId(3),
+            "x".to_string(),
             OpKind::Read,
             Timestamp(500),
             Timestamp(600),
@@ -235,6 +252,7 @@ mod tests {
         let op = Operation::new(
             1,
             ClientId(1),
+            "x".to_string(),
             OpKind::Write {
                 value: "a".to_string(),
             },
@@ -257,6 +275,7 @@ mod tests {
         let op1 = Operation::new(
             1,
             ClientId(1),
+            "x".to_string(),
             OpKind::Write {
                 value: "a".to_string(),
             },
@@ -268,6 +287,7 @@ mod tests {
         let op2 = Operation::new(
             2,
             ClientId(1),
+            "x".to_string(),
             OpKind::Read,
             Timestamp(300),
             Timestamp(400),
@@ -289,6 +309,7 @@ mod tests {
         history.add(Operation::new(
             2,
             ClientId(1),
+            "x".to_string(),
             OpKind::Read,
             Timestamp(300),
             Timestamp(400),
@@ -297,6 +318,7 @@ mod tests {
         history.add(Operation::new(
             1,
             ClientId(1),
+            "x".to_string(),
             OpKind::Write {
                 value: "a".to_string(),
             },
@@ -317,6 +339,7 @@ mod tests {
         history.add(Operation::new(
             1,
             ClientId(1),
+            "x".to_string(),
             OpKind::Write {
                 value: "a".to_string(),
             },
@@ -327,6 +350,7 @@ mod tests {
         history.add(Operation::new(
             2,
             ClientId(1),
+            "x".to_string(),
             OpKind::Read,
             Timestamp(300),
             Timestamp(400),
@@ -335,6 +359,7 @@ mod tests {
         history.add(Operation::new(
             3,
             ClientId(1),
+            "x".to_string(),
             OpKind::Read,
             Timestamp(500),
             Timestamp(600),

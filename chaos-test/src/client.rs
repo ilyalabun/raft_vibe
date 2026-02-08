@@ -120,6 +120,7 @@ impl TestClient {
         self.record(Operation::new(
             op_id,
             self.client_id,
+            key.to_string(),
             OpKind::Read,
             invoke_ts,
             complete_ts,
@@ -146,6 +147,7 @@ impl TestClient {
         self.record(Operation::new(
             op_id,
             self.client_id,
+            key.to_string(),
             OpKind::Write {
                 value: value.to_string(),
             },

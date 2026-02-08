@@ -16,6 +16,7 @@ fn test_sequential_operations() {
     history.add(Operation::new(
         1,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Write {
             value: "a".to_string(),
         },
@@ -26,6 +27,7 @@ fn test_sequential_operations() {
     history.add(Operation::new(
         2,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Read,
         Timestamp::from_micros(200),
         Timestamp::from_micros(300),
@@ -47,6 +49,7 @@ fn test_rejects_stale_read() {
     history.add(Operation::new(
         1,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Write {
             value: "a".to_string(),
         },
@@ -57,6 +60,7 @@ fn test_rejects_stale_read() {
     history.add(Operation::new(
         2,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Read,
         Timestamp::from_micros(200),
         Timestamp::from_micros(300),
@@ -78,6 +82,7 @@ fn test_concurrent_operations() {
     history.add(Operation::new(
         1,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Write {
             value: "a".to_string(),
         },
@@ -88,6 +93,7 @@ fn test_concurrent_operations() {
     history.add(Operation::new(
         2,
         ClientId::new(2),
+        "x".to_string(),
         OpKind::Write {
             value: "b".to_string(),
         },
@@ -98,6 +104,7 @@ fn test_concurrent_operations() {
     history.add(Operation::new(
         3,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Read,
         Timestamp::from_micros(400),
         Timestamp::from_micros(500),
@@ -117,6 +124,7 @@ fn test_rejects_impossible_read() {
     history.add(Operation::new(
         1,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Write {
             value: "a".to_string(),
         },
@@ -127,6 +135,7 @@ fn test_rejects_impossible_read() {
     history.add(Operation::new(
         2,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Write {
             value: "b".to_string(),
         },
@@ -137,6 +146,7 @@ fn test_rejects_impossible_read() {
     history.add(Operation::new(
         3,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Read,
         Timestamp::from_micros(400),
         Timestamp::from_micros(500),
@@ -156,6 +166,7 @@ fn test_filters_errors() {
     history.add(Operation::new(
         1,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Write {
             value: "a".to_string(),
         },
@@ -166,6 +177,7 @@ fn test_filters_errors() {
     history.add(Operation::new(
         2,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Read,
         Timestamp::from_micros(150),
         Timestamp::from_micros(250),
@@ -174,6 +186,7 @@ fn test_filters_errors() {
     history.add(Operation::new(
         3,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Read,
         Timestamp::from_micros(300),
         Timestamp::from_micros(400),
@@ -209,6 +222,7 @@ fn test_initial_read_none() {
     history.add(Operation::new(
         1,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Read,
         Timestamp::from_micros(0),
         Timestamp::from_micros(100),
@@ -231,6 +245,7 @@ fn test_detects_future_read() {
     history.add(Operation::new(
         1,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Read,
         Timestamp::from_micros(0),
         Timestamp::from_micros(100),
@@ -239,6 +254,7 @@ fn test_detects_future_read() {
     history.add(Operation::new(
         2,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Write {
             value: "a".to_string(),
         },
@@ -249,6 +265,7 @@ fn test_detects_future_read() {
     history.add(Operation::new(
         3,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Write {
             value: "b".to_string(),
         },
@@ -274,6 +291,7 @@ fn test_read_during_write_sees_old() {
     history.add(Operation::new(
         1,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Write {
             value: "a".to_string(),
         },
@@ -284,6 +302,7 @@ fn test_read_during_write_sees_old() {
     history.add(Operation::new(
         2,
         ClientId::new(2),
+        "x".to_string(),
         OpKind::Read,
         Timestamp::from_micros(100),
         Timestamp::from_micros(200),
@@ -304,6 +323,7 @@ fn test_read_during_write_sees_new() {
     history.add(Operation::new(
         1,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Write {
             value: "a".to_string(),
         },
@@ -314,6 +334,7 @@ fn test_read_during_write_sees_new() {
     history.add(Operation::new(
         2,
         ClientId::new(2),
+        "x".to_string(),
         OpKind::Read,
         Timestamp::from_micros(100),
         Timestamp::from_micros(200),
@@ -334,6 +355,7 @@ fn test_concurrent_writes_read_sees_first() {
     history.add(Operation::new(
         1,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Write {
             value: "a".to_string(),
         },
@@ -344,6 +366,7 @@ fn test_concurrent_writes_read_sees_first() {
     history.add(Operation::new(
         2,
         ClientId::new(2),
+        "x".to_string(),
         OpKind::Write {
             value: "b".to_string(),
         },
@@ -354,6 +377,7 @@ fn test_concurrent_writes_read_sees_first() {
     history.add(Operation::new(
         3,
         ClientId::new(1),
+        "x".to_string(),
         OpKind::Read,
         Timestamp::from_micros(400),
         Timestamp::from_micros(500),
@@ -374,6 +398,7 @@ fn test_many_concurrent_writes() {
         history.add(Operation::new(
             i,
             ClientId::new(i),
+            "x".to_string(),
             OpKind::Write {
                 value: format!("v{}", i),
             },
@@ -386,6 +411,7 @@ fn test_many_concurrent_writes() {
     history.add(Operation::new(
         5,
         ClientId::new(0),
+        "x".to_string(),
         OpKind::Read,
         Timestamp::from_micros(200),
         Timestamp::from_micros(300),
@@ -394,4 +420,112 @@ fn test_many_concurrent_writes() {
 
     let result = LinearizabilityChecker::check(&history);
     assert!(result.is_linearizable);
+}
+
+/// Test multiple keys are verified independently.
+#[test]
+fn test_multiple_keys_independent() {
+    let mut history = History::new();
+
+    // Key "a": write then read
+    history.add(Operation::new(
+        1,
+        ClientId::new(1),
+        "a".to_string(),
+        OpKind::Write {
+            value: "val1".to_string(),
+        },
+        Timestamp::from_micros(0),
+        Timestamp::from_micros(100),
+        OpResult::WriteOk,
+    ));
+    history.add(Operation::new(
+        2,
+        ClientId::new(1),
+        "a".to_string(),
+        OpKind::Read,
+        Timestamp::from_micros(200),
+        Timestamp::from_micros(300),
+        OpResult::ReadOk(Some("val1".to_string())),
+    ));
+
+    // Key "b": write then read
+    history.add(Operation::new(
+        3,
+        ClientId::new(2),
+        "b".to_string(),
+        OpKind::Write {
+            value: "val2".to_string(),
+        },
+        Timestamp::from_micros(50),
+        Timestamp::from_micros(150),
+        OpResult::WriteOk,
+    ));
+    history.add(Operation::new(
+        4,
+        ClientId::new(2),
+        "b".to_string(),
+        OpKind::Read,
+        Timestamp::from_micros(250),
+        Timestamp::from_micros(350),
+        OpResult::ReadOk(Some("val2".to_string())),
+    ));
+
+    let result = LinearizabilityChecker::check(&history);
+    assert!(result.is_linearizable);
+    assert_eq!(result.linearization.unwrap().len(), 4);
+}
+
+/// Test that failure on one key causes overall failure.
+#[test]
+fn test_multiple_keys_one_fails() {
+    let mut history = History::new();
+
+    // Key "a": valid - write then read
+    history.add(Operation::new(
+        1,
+        ClientId::new(1),
+        "a".to_string(),
+        OpKind::Write {
+            value: "val1".to_string(),
+        },
+        Timestamp::from_micros(0),
+        Timestamp::from_micros(100),
+        OpResult::WriteOk,
+    ));
+    history.add(Operation::new(
+        2,
+        ClientId::new(1),
+        "a".to_string(),
+        OpKind::Read,
+        Timestamp::from_micros(200),
+        Timestamp::from_micros(300),
+        OpResult::ReadOk(Some("val1".to_string())),
+    ));
+
+    // Key "b": INVALID - read value never written
+    history.add(Operation::new(
+        3,
+        ClientId::new(2),
+        "b".to_string(),
+        OpKind::Write {
+            value: "val2".to_string(),
+        },
+        Timestamp::from_micros(50),
+        Timestamp::from_micros(150),
+        OpResult::WriteOk,
+    ));
+    history.add(Operation::new(
+        4,
+        ClientId::new(2),
+        "b".to_string(),
+        OpKind::Read,
+        Timestamp::from_micros(250),
+        Timestamp::from_micros(350),
+        OpResult::ReadOk(Some("never_written".to_string())),
+    ));
+
+    let result = LinearizabilityChecker::check(&history);
+    assert!(!result.is_linearizable);
+    assert!(result.error.as_ref().unwrap().contains("Key 'b'"));
 }

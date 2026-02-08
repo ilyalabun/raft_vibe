@@ -21,7 +21,7 @@ async fn test_healthy_cluster() {
         node_addresses: cluster.all_addr_strings(),
         client_count: 5,
         ops_per_client: 50,
-        key: "x".to_string(),
+        keys: vec!["x".to_string()],
         write_ratio: 0.5,
     };
 
@@ -62,7 +62,7 @@ async fn test_high_concurrency() {
         node_addresses: cluster.all_addr_strings(),
         client_count: 10,
         ops_per_client: 20,
-        key: "stress".to_string(),
+        keys: vec!["stress".to_string()],
         write_ratio: 0.5,
     };
 
@@ -95,7 +95,7 @@ async fn test_write_heavy() {
         node_addresses: cluster.all_addr_strings(),
         client_count: 5,
         ops_per_client: 30,
-        key: "writeheavy".to_string(),
+        keys: vec!["writeheavy".to_string()],
         write_ratio: 0.8,
     };
 
@@ -128,7 +128,7 @@ async fn test_read_heavy() {
         node_addresses: cluster.all_addr_strings(),
         client_count: 5,
         ops_per_client: 30,
-        key: "readheavy".to_string(),
+        keys: vec!["readheavy".to_string()],
         write_ratio: 0.2,
     };
 
@@ -142,6 +142,43 @@ async fn test_read_heavy() {
     assert!(
         result.check.is_linearizable,
         "Read-heavy workload should be linearizable: {:?}",
+        result.check.error
+    );
+
+    cluster.shutdown().await;
+}
+
+/// Test with multiple independent keys.
+#[tokio::test]
+async fn test_multiple_keys() {
+    let cluster = TestCluster::new().await;
+
+    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await;
+    assert!(leader.is_some(), "Cluster should elect a leader");
+
+    // Multiple keys: each key is verified independently
+    let config = TestConfig {
+        node_addresses: cluster.all_addr_strings(),
+        client_count: 5,
+        ops_per_client: 30,
+        keys: vec![
+            "key1".to_string(),
+            "key2".to_string(),
+            "key3".to_string(),
+        ],
+        write_ratio: 0.5,
+    };
+
+    let result = run_test(config).await;
+
+    println!(
+        "Multiple keys: {} total ops, {} successful, linearizable: {}",
+        result.total_ops, result.successful_ops, result.check.is_linearizable
+    );
+
+    assert!(
+        result.check.is_linearizable,
+        "Multiple keys should be linearizable: {:?}",
         result.check.error
     );
 

@@ -846,6 +846,37 @@ The WGL algorithm is correct but slow for negative cases. Adding fast pre-checks
 
 All 239 tests pass.
 
+**Prompt:** "Implement the following plan: Add Multiple Keys Support to Linearizability Test"
+
+**Adding Multi-Key Support to Linearizability Tests**
+
+Extended the linearizability testing framework to support multiple independent keys. Previously, all clients operated on a single key, limiting test coverage. Now clients randomly select from a configurable set of keys, and the checker verifies linearizability for each key independently.
+
+**Operation Key Tracking**
+
+Added a `key: String` field to the `Operation` struct in `history.rs`. Updated `Operation::new()` to accept the key parameter. Added helper methods to `History`: `ops_for_key()` filters operations by key, `unique_keys()` returns all keys in the history.
+
+**Per-Key Linearizability Checking**
+
+Refactored `LinearizabilityChecker::check()` to iterate over unique keys and verify each independently. Created `check_single_key()` containing the existing WGL algorithm. If any key fails linearizability, the check fails with an error message indicating which key and why.
+
+**Test Configuration**
+
+Changed `TestConfig.key: String` to `keys: Vec<String>`. Updated `run_client_workload()` to randomly select a key from the available keys for each operation using `rng.random_range(0..keys.len())`. Default config uses single key `["x"]` for backward compatibility.
+
+**New Tests**
+
+Added multi-key unit tests to the checker:
+- `test_multiple_keys_independent` - Two keys with valid operations
+- `test_multiple_keys_one_fails` - One key valid, one invalid (failure should propagate)
+- `test_multiple_keys_concurrent` - Concurrent operations across multiple keys
+- `test_multiple_keys_stale_read_on_one` - Stale read on one key fails overall check
+- `test_three_keys_all_valid` - Three keys with various operations
+
+Added integration test `test_multiple_keys` that runs 5 clients with 30 ops each across 3 keys (`key1`, `key2`, `key3`).
+
+All 253 tests pass.
+
 ---
 
 ## Next Up

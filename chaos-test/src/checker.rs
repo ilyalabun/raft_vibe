@@ -59,6 +59,48 @@ impl RegisterModel {
 pub struct LinearizabilityChecker;
 
 impl LinearizabilityChecker {
+    /// Check if multi-key history is linearizable
+    ///
+    /// Verifies linearizability for each key independently. Each key is treated
+    /// as an independent single-key register.
+    pub fn check(history: &History) -> CheckResult {
+        let keys: Vec<_> = history.unique_keys().into_iter().collect();
+
+        if keys.is_empty() {
+            return CheckResult::linearizable(vec![]);
+        }
+
+        let mut all_linearizations = Vec::new();
+
+        for key in keys {
+            let key_ops: Vec<_> = history
+                .ops_for_key(key)
+                .into_iter()
+                .filter(|op| !matches!(op.result, OpResult::Error(_)))
+                .collect();
+
+            if key_ops.is_empty() {
+                continue;
+            }
+
+            let result = Self::check_single_key(&key_ops);
+
+            if !result.is_linearizable {
+                return CheckResult::not_linearizable(format!(
+                    "Key '{}': {}",
+                    key,
+                    result.error.unwrap_or_default()
+                ));
+            }
+
+            if let Some(lin) = result.linearization {
+                all_linearizations.extend(lin);
+            }
+        }
+
+        CheckResult::linearizable(all_linearizations)
+    }
+
     /// Check if history is linearizable for a single-key register
     ///
     /// Uses the Wing-Gong algorithm:
@@ -66,10 +108,7 @@ impl LinearizabilityChecker {
     /// 2. Quick check: all read values must have been written (or be None/initial)
     /// 3. Recursive search with backtracking
     /// 4. Track the "frontier" - earliest time at which next op can linearize
-    pub fn check(history: &History) -> CheckResult {
-        // Get only successful operations
-        let ops: Vec<_> = history.successful_ops();
-
+    fn check_single_key(ops: &[&Operation]) -> CheckResult {
         if ops.is_empty() {
             return CheckResult::linearizable(vec![]);
         }
@@ -79,13 +118,13 @@ impl LinearizabilityChecker {
             std::collections::HashSet::new();
         written_values.insert(None); // Initial state
 
-        for op in &ops {
+        for op in ops {
             if let OpKind::Write { value } = &op.kind {
                 written_values.insert(Some(value.clone()));
             }
         }
 
-        for op in &ops {
+        for op in ops {
             if let (OpKind::Read, OpResult::ReadOk(read_value)) = (&op.kind, &op.result) {
                 if !written_values.contains(read_value) {
                     return CheckResult::not_linearizable(format!(
@@ -100,10 +139,10 @@ impl LinearizabilityChecker {
         // If a read returns None (initial state) but started after any write completed,
         // and no later writes could have "undone" the value, it's a stale read.
         // (For a single-key register without DELETE, once written, reading None is stale)
-        for read_op in &ops {
+        for read_op in ops {
             if let (OpKind::Read, OpResult::ReadOk(None)) = (&read_op.kind, &read_op.result) {
                 // Check if any write completed before this read started
-                for write_op in &ops {
+                for write_op in ops {
                     if let OpKind::Write { value } = &write_op.kind {
                         // Write completed before read started - read should not see None
                         if write_op.complete_ts.0 < read_op.invoke_ts.0 {
@@ -128,7 +167,7 @@ impl LinearizabilityChecker {
         let mut linearization = Vec::new();
 
         // Start with frontier at 0 (any op can linearize from the beginning)
-        if Self::search(&ops, remaining, model, 0, &mut linearization) {
+        if Self::search(ops, remaining, model, 0, &mut linearization) {
             CheckResult::linearizable(linearization)
         } else {
             CheckResult::not_linearizable(
@@ -247,11 +286,12 @@ mod tests {
     use super::*;
     use crate::history::{ClientId, History, OpKind, OpResult, Operation, Timestamp};
 
-    /// Helper to create a write operation
-    fn write_op(id: u64, value: &str, invoke: u64, complete: u64) -> Operation {
+    /// Helper to create a write operation for a specific key
+    fn write_op_key(id: u64, key: &str, value: &str, invoke: u64, complete: u64) -> Operation {
         Operation::new(
             id,
             ClientId(1),
+            key.to_string(),
             OpKind::Write {
                 value: value.to_string(),
             },
@@ -261,16 +301,27 @@ mod tests {
         )
     }
 
-    /// Helper to create a read operation
-    fn read_op(id: u64, value: Option<&str>, invoke: u64, complete: u64) -> Operation {
+    /// Helper to create a write operation (default key "x")
+    fn write_op(id: u64, value: &str, invoke: u64, complete: u64) -> Operation {
+        write_op_key(id, "x", value, invoke, complete)
+    }
+
+    /// Helper to create a read operation for a specific key
+    fn read_op_key(id: u64, key: &str, value: Option<&str>, invoke: u64, complete: u64) -> Operation {
         Operation::new(
             id,
             ClientId(1),
+            key.to_string(),
             OpKind::Read,
             Timestamp(invoke),
             Timestamp(complete),
             OpResult::ReadOk(value.map(|s| s.to_string())),
         )
+    }
+
+    /// Helper to create a read operation (default key "x")
+    fn read_op(id: u64, value: Option<&str>, invoke: u64, complete: u64) -> Operation {
+        read_op_key(id, "x", value, invoke, complete)
     }
 
     #[test]
@@ -452,6 +503,7 @@ mod tests {
         history.add(Operation::new(
             2,
             ClientId(1),
+            "x".to_string(),
             OpKind::Read,
             Timestamp(200),
             Timestamp(300),
@@ -493,5 +545,102 @@ mod tests {
             // op_id should not be a write (0-4)
             assert!(op_id >= 5 || op_id == 3);
         }
+    }
+
+    // Multi-key tests
+
+    #[test]
+    fn test_multiple_keys_independent() {
+        // Two keys with independent operations should both be linearizable
+        let mut history = History::new();
+
+        // Key "a": write then read
+        history.add(write_op_key(1, "a", "val1", 0, 100));
+        history.add(read_op_key(2, "a", Some("val1"), 200, 300));
+
+        // Key "b": write then read
+        history.add(write_op_key(3, "b", "val2", 50, 150));
+        history.add(read_op_key(4, "b", Some("val2"), 250, 350));
+
+        let result = LinearizabilityChecker::check(&history);
+        assert!(result.is_linearizable);
+        let lin = result.linearization.unwrap();
+        assert_eq!(lin.len(), 4);
+    }
+
+    #[test]
+    fn test_multiple_keys_one_fails() {
+        // One key is linearizable, another is not - should fail
+        let mut history = History::new();
+
+        // Key "a": valid - write then read
+        history.add(write_op_key(1, "a", "val1", 0, 100));
+        history.add(read_op_key(2, "a", Some("val1"), 200, 300));
+
+        // Key "b": INVALID - read value never written
+        history.add(write_op_key(3, "b", "val2", 50, 150));
+        history.add(read_op_key(4, "b", Some("never_written"), 250, 350));
+
+        let result = LinearizabilityChecker::check(&history);
+        assert!(!result.is_linearizable);
+        assert!(result.error.as_ref().unwrap().contains("Key 'b'"));
+    }
+
+    #[test]
+    fn test_multiple_keys_concurrent() {
+        // Concurrent operations across multiple keys
+        let mut history = History::new();
+
+        // All operations overlap in time
+        history.add(write_op_key(1, "x", "a", 0, 200));
+        history.add(write_op_key(2, "y", "b", 50, 250));
+        history.add(read_op_key(3, "x", Some("a"), 100, 300));
+        history.add(read_op_key(4, "y", Some("b"), 150, 350));
+
+        let result = LinearizabilityChecker::check(&history);
+        assert!(result.is_linearizable);
+    }
+
+    #[test]
+    fn test_multiple_keys_stale_read_on_one() {
+        // Stale read on one key should fail the whole check
+        let mut history = History::new();
+
+        // Key "a": valid
+        history.add(write_op_key(1, "a", "val1", 0, 100));
+        history.add(read_op_key(2, "a", Some("val1"), 200, 300));
+
+        // Key "b": STALE READ - write completed, then read returns None
+        history.add(write_op_key(3, "b", "val2", 0, 100));
+        history.add(read_op_key(4, "b", None, 200, 300)); // Stale!
+
+        let result = LinearizabilityChecker::check(&history);
+        assert!(!result.is_linearizable);
+        assert!(result.error.as_ref().unwrap().contains("Key 'b'"));
+        assert!(result.error.as_ref().unwrap().contains("Stale read"));
+    }
+
+    #[test]
+    fn test_three_keys_all_valid() {
+        // Three independent keys, all linearizable
+        let mut history = History::new();
+
+        // Key "k1"
+        history.add(write_op_key(1, "k1", "v1", 0, 100));
+        history.add(read_op_key(2, "k1", Some("v1"), 200, 300));
+
+        // Key "k2"
+        history.add(write_op_key(3, "k2", "v2", 0, 100));
+        history.add(write_op_key(4, "k2", "v3", 200, 300));
+        history.add(read_op_key(5, "k2", Some("v3"), 400, 500));
+
+        // Key "k3"
+        history.add(read_op_key(6, "k3", None, 0, 100)); // Read initial None
+        history.add(write_op_key(7, "k3", "v4", 200, 300));
+        history.add(read_op_key(8, "k3", Some("v4"), 400, 500));
+
+        let result = LinearizabilityChecker::check(&history);
+        assert!(result.is_linearizable);
+        assert_eq!(result.linearization.unwrap().len(), 8);
     }
 }

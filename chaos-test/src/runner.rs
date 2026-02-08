@@ -23,8 +23,8 @@ pub struct TestConfig {
     pub client_count: usize,
     /// Number of operations per client
     pub ops_per_client: usize,
-    /// Key to use for single-key register test
-    pub key: String,
+    /// Keys to use for multi-key register test
+    pub keys: Vec<String>,
     /// Ratio of writes (0.0 = all reads, 1.0 = all writes)
     pub write_ratio: f64,
 }
@@ -39,7 +39,7 @@ impl Default for TestConfig {
             ],
             client_count: 5,
             ops_per_client: 50,
-            key: "x".to_string(),
+            keys: vec!["x".to_string()],
             write_ratio: 0.5,
         }
     }
@@ -71,7 +71,7 @@ pub struct TestResult {
 ///     node_addresses: vec!["127.0.0.1:8081".to_string()],
 ///     client_count: 3,
 ///     ops_per_client: 20,
-///     key: "test_key".to_string(),
+///     keys: vec!["test_key".to_string()],
 ///     write_ratio: 0.5,
 /// };
 ///
@@ -96,12 +96,12 @@ pub async fn run_test(config: TestConfig) -> TestResult {
             op_counter.clone(),
         );
 
-        let key = config.key.clone();
+        let keys = config.keys.clone();
         let ops = config.ops_per_client;
         let write_ratio = config.write_ratio;
 
         handles.push(tokio::spawn(async move {
-            run_client_workload(client, &key, ops, write_ratio).await
+            run_client_workload(client, &keys, ops, write_ratio).await
         }));
     }
 
@@ -130,12 +130,15 @@ pub async fn run_test(config: TestConfig) -> TestResult {
 }
 
 /// Run workload for a single client
-async fn run_client_workload(client: TestClient, key: &str, ops: usize, write_ratio: f64) {
+async fn run_client_workload(client: TestClient, keys: &[String], ops: usize, write_ratio: f64) {
     // Use StdRng which is Send (unlike ThreadRng)
     let mut rng = StdRng::from_os_rng();
     let mut value_counter = 0u64;
 
     for _ in 0..ops {
+        // Select random key for this operation
+        let key = &keys[rng.random_range(0..keys.len())];
+
         let is_write: f64 = rng.random();
         let is_write = is_write < write_ratio;
 
@@ -165,7 +168,7 @@ mod tests {
         let config = TestConfig::default();
         assert_eq!(config.client_count, 5);
         assert_eq!(config.ops_per_client, 50);
-        assert_eq!(config.key, "x");
+        assert_eq!(config.keys, vec!["x".to_string()]);
         assert!((config.write_ratio - 0.5).abs() < f64::EPSILON);
     }
 }
