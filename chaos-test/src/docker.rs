@@ -265,6 +265,29 @@ impl DockerCluster {
         }
     }
 
+    /// Create a one-way network partition: `from` cannot communicate with `to`,
+    /// but `to` can still send to `from`.
+    pub async fn partition_one_way(&self, from: usize, to: usize) {
+        let ip_to = self.get_container_ip(to).await
+            .unwrap_or_else(|| panic!("Could not get IP for node {}", to));
+
+        // Block traffic only on the `from` node
+        self.iptables_rule(from, "-A", &ip_to).await;
+
+        println!("Partitioned node {} -x-> node {} (one-way)", from, to);
+    }
+
+    /// Heal a one-way network partition from `from` to `to`
+    pub async fn heal_partition_one_way(&self, from: usize, to: usize) {
+        let ip_to = self.get_container_ip(to).await
+            .unwrap_or_else(|| panic!("Could not get IP for node {}", to));
+
+        // Remove block only on the `from` node
+        self.iptables_rule(from, "-D", &ip_to).await;
+
+        println!("Healed one-way partition node {} -x-> node {}", from, to);
+    }
+
     /// Create a symmetric network partition between two nodes using iptables
     pub async fn partition(&self, node_a: usize, node_b: usize) {
         let ip_a = self.get_container_ip(node_a).await
