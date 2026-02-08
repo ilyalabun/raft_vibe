@@ -1,9 +1,10 @@
 //! Wing-Gong Linearizability (WGL) checker
 //!
 //! Implements the WGL algorithm for checking linearizability of concurrent operations
-//! on a single-key register.
+//! on a single-key register. Supports indeterminate (errored) writes that may or may
+//! not have been committed — these are treated as optional in the linearization search.
 
-use crate::history::{History, OpKind, OpResult, Operation};
+use crate::history::{History, OpKind, OpResult, Operation, Timestamp};
 
 /// Result of linearizability check
 #[derive(Debug)]
@@ -63,6 +64,10 @@ impl LinearizabilityChecker {
     ///
     /// Verifies linearizability for each key independently. Each key is treated
     /// as an independent single-key register.
+    ///
+    /// Errored write operations are treated as "indeterminate" — they may or may not
+    /// have been committed. The checker will try to find a valid linearization both
+    /// with and without these operations.
     pub fn check(history: &History) -> CheckResult {
         let keys: Vec<_> = history.unique_keys().into_iter().collect();
 
@@ -73,17 +78,28 @@ impl LinearizabilityChecker {
         let mut all_linearizations = Vec::new();
 
         for key in keys {
-            let key_ops: Vec<_> = history
-                .ops_for_key(key)
-                .into_iter()
+            let all_key_ops = history.ops_for_key(key);
+
+            // Separate successful ops from indeterminate writes
+            let key_ops: Vec<_> = all_key_ops
+                .iter()
                 .filter(|op| !matches!(op.result, OpResult::Error(_)))
+                .copied()
                 .collect();
 
-            if key_ops.is_empty() {
+            let indeterminate_writes: Vec<_> = all_key_ops
+                .iter()
+                .filter(|op| {
+                    matches!((&op.kind, &op.result), (OpKind::Write { .. }, OpResult::Error(_)))
+                })
+                .copied()
+                .collect();
+
+            if key_ops.is_empty() && indeterminate_writes.is_empty() {
                 continue;
             }
 
-            let result = Self::check_single_key(&key_ops);
+            let result = Self::check_single_key(&key_ops, &indeterminate_writes);
 
             if !result.is_linearizable {
                 return CheckResult::not_linearizable(format!(
@@ -104,21 +120,34 @@ impl LinearizabilityChecker {
     /// Check if history is linearizable for a single-key register
     ///
     /// Uses the Wing-Gong algorithm:
-    /// 1. Filter to only successful operations
+    /// 1. Filter to only successful operations (indeterminate handled separately)
     /// 2. Quick check: all read values must have been written (or be None/initial)
     /// 3. Recursive search with backtracking
     /// 4. Track the "frontier" - earliest time at which next op can linearize
-    fn check_single_key(ops: &[&Operation]) -> CheckResult {
-        if ops.is_empty() {
+    ///
+    /// Indeterminate writes are treated as optional: they may be included in the
+    /// linearization (with their time interval extended to the end of the history)
+    /// or skipped entirely.
+    fn check_single_key(
+        ops: &[&Operation],
+        indeterminate_writes: &[&Operation],
+    ) -> CheckResult {
+        if ops.is_empty() && indeterminate_writes.is_empty() {
             return CheckResult::linearizable(vec![]);
         }
 
-        // Fast check: collect all written values and verify reads only return those values
+        // Fast check: collect all written values and verify reads only return those values.
+        // Include indeterminate write values since they may have been committed.
         let mut written_values: std::collections::HashSet<Option<String>> =
             std::collections::HashSet::new();
         written_values.insert(None); // Initial state
 
         for op in ops {
+            if let OpKind::Write { value } = &op.kind {
+                written_values.insert(Some(value.clone()));
+            }
+        }
+        for op in indeterminate_writes {
             if let OpKind::Write { value } = &op.kind {
                 written_values.insert(Some(value.clone()));
             }
@@ -136,20 +165,14 @@ impl LinearizabilityChecker {
         }
 
         // Fast check for obvious stale reads:
-        // If a read returns None (initial state) but started after any write completed,
-        // and no later writes could have "undone" the value, it's a stale read.
-        // (For a single-key register without DELETE, once written, reading None is stale)
+        // If a read returns None (initial state) but started after a *confirmed* write completed,
+        // it's a stale read. Skip this check for indeterminate writes (they may not have committed).
         for read_op in ops {
             if let (OpKind::Read, OpResult::ReadOk(None)) = (&read_op.kind, &read_op.result) {
-                // Check if any write completed before this read started
+                // Check if any confirmed write completed before this read started
                 for write_op in ops {
                     if let OpKind::Write { value } = &write_op.kind {
-                        // Write completed before read started - read should not see None
                         if write_op.complete_ts.0 < read_op.invoke_ts.0 {
-                            // Check if there's any way the read could validly see None:
-                            // Only if there's a concurrent write that could linearize before
-                            // the first write. But if the write completed, it must linearize
-                            // before its complete_ts.
                             return CheckResult::not_linearizable(format!(
                                 "Stale read: Read started at {} returned None, but write of {:?} completed at {}",
                                 read_op.invoke_ts.0, value, write_op.complete_ts.0
@@ -160,14 +183,56 @@ impl LinearizabilityChecker {
             }
         }
 
-        // Build list of remaining operations (indices into ops)
-        let remaining: Vec<usize> = (0..ops.len()).collect();
+        // Find the max timestamp across all operations to use as the extended
+        // complete_ts for indeterminate writes
+        let max_ts = ops
+            .iter()
+            .map(|op| op.complete_ts.0)
+            .chain(indeterminate_writes.iter().map(|op| op.complete_ts.0))
+            .max()
+            .unwrap_or(0);
+
+        // Create extended copies of indeterminate writes with complete_ts = max_ts.
+        // These writes could have committed at any point after their invocation.
+        let extended_indeterminate: Vec<Operation> = indeterminate_writes
+            .iter()
+            .map(|op| {
+                Operation::new(
+                    op.id,
+                    op.client_id,
+                    op.key.clone(),
+                    op.kind.clone(),
+                    op.invoke_ts,
+                    Timestamp(max_ts),
+                    OpResult::WriteOk, // Treat as if it succeeded for the model
+                )
+            })
+            .collect();
+
+        // Build the combined ops array: confirmed ops first, then indeterminate
+        let confirmed_count = ops.len();
+        let mut all_ops: Vec<&Operation> = ops.to_vec();
+        for op in &extended_indeterminate {
+            all_ops.push(op);
+        }
+
+        // Build list of remaining required operations (indices into all_ops for confirmed ops)
+        let required: Vec<usize> = (0..confirmed_count).collect();
+        // Indices for optional (indeterminate) ops
+        let optional: Vec<usize> = (confirmed_count..all_ops.len()).collect();
 
         let model = RegisterModel::new();
         let mut linearization = Vec::new();
 
         // Start with frontier at 0 (any op can linearize from the beginning)
-        if Self::search(ops, remaining, model, 0, &mut linearization) {
+        if Self::search(
+            &all_ops,
+            required,
+            optional,
+            model,
+            0,
+            &mut linearization,
+        ) {
             CheckResult::linearizable(linearization)
         } else {
             CheckResult::not_linearizable(
@@ -176,75 +241,109 @@ impl LinearizabilityChecker {
         }
     }
 
-    /// Recursive WGL search
+    /// Recursive WGL search with optional operations
     ///
     /// Returns true if a valid linearization was found, false otherwise.
     /// The linearization order is accumulated in the `linearization` vector.
     ///
     /// `frontier` is the earliest time at which the next operation can linearize.
-    /// This is at least the invoke_ts of all previously linearized operations.
+    ///
+    /// `required` operations must all be placed. `optional` operations may be placed
+    /// or skipped. The search succeeds when all required ops are placed.
     fn search(
         ops: &[&Operation],
-        remaining: Vec<usize>,
+        required: Vec<usize>,
+        optional: Vec<usize>,
         model: RegisterModel,
         frontier: u64,
         linearization: &mut Vec<u64>,
     ) -> bool {
-        if remaining.is_empty() {
+        // Success: all required operations have been placed
+        if required.is_empty() {
             return true;
         }
 
-        // Find all operations that could linearize next.
-        // An operation can linearize if there exists a time t such that:
-        // - t >= frontier (after all previously linearized operations)
-        // - t is in [invoke_ts, complete_ts] (within the operation's interval)
-        // This is equivalent to: complete_ts >= frontier (since we can pick t = max(invoke_ts, frontier))
-        let candidates: Vec<usize> = remaining
+        // Find the earliest complete_ts among remaining required ops.
+        // Some operation MUST be linearized before this time, so only operations
+        // invoked before this deadline are valid candidates.
+        let min_complete = required
             .iter()
-            .copied()
-            .filter(|&i| ops[i].complete_ts.0 >= frontier)
-            .collect();
+            .map(|&i| ops[i].complete_ts.0)
+            .min()
+            .unwrap_or(u64::MAX);
+
+        let mut candidates: Vec<(usize, bool)> = Vec::new(); // (index, is_optional)
+
+        for &i in &required {
+            if ops[i].invoke_ts.0 <= min_complete && ops[i].complete_ts.0 >= frontier {
+                candidates.push((i, false));
+            }
+        }
+        for &i in &optional {
+            if ops[i].invoke_ts.0 <= min_complete && ops[i].complete_ts.0 >= frontier {
+                candidates.push((i, true));
+            }
+        }
 
         if candidates.is_empty() {
             return false;
         }
 
         // Sort candidates to try more promising orderings first:
-        // 1. Operations with earlier invoke_ts (they "should" linearize earlier)
-        // 2. Writes before reads (writes enable more reads to succeed)
-        let mut sorted_candidates = candidates;
-        sorted_candidates.sort_by(|&a, &b| {
+        // 1. Operations with earlier invoke_ts
+        // 2. Writes before reads
+        candidates.sort_by(|&(a, _), &(b, _)| {
             let a_is_write = matches!(ops[a].kind, OpKind::Write { .. });
             let b_is_write = matches!(ops[b].kind, OpKind::Write { .. });
-            // First by invoke time, then writes before reads
-            ops[a].invoke_ts.cmp(&ops[b].invoke_ts)
+            ops[a]
+                .invoke_ts
+                .cmp(&ops[b].invoke_ts)
                 .then_with(|| b_is_write.cmp(&a_is_write))
         });
 
         // Try each candidate
-        for candidate_idx in sorted_candidates {
+        for (candidate_idx, is_optional) in candidates {
             let op = ops[candidate_idx];
 
             // Check if this operation is valid given current model state
             let (is_valid, new_model) = Self::try_apply(op, &model);
 
             if is_valid {
-                // Remove this operation from remaining
-                let new_remaining: Vec<usize> = remaining
-                    .iter()
-                    .copied()
-                    .filter(|&i| i != candidate_idx)
-                    .collect();
+                // Remove this operation from the appropriate set
+                let new_required: Vec<usize> = if is_optional {
+                    required.clone()
+                } else {
+                    required
+                        .iter()
+                        .copied()
+                        .filter(|&i| i != candidate_idx)
+                        .collect()
+                };
+                let new_optional: Vec<usize> = if is_optional {
+                    optional
+                        .iter()
+                        .copied()
+                        .filter(|&i| i != candidate_idx)
+                        .collect()
+                } else {
+                    optional.clone()
+                };
 
                 // Add to linearization
                 linearization.push(op.id);
 
-                // Update frontier: the next op must linearize at or after this op's invoke time
-                // (Since this op linearizes at some point >= max(frontier, op.invoke_ts))
+                // Update frontier
                 let new_frontier = frontier.max(op.invoke_ts.0);
 
                 // Recurse
-                if Self::search(ops, new_remaining, new_model, new_frontier, linearization) {
+                if Self::search(
+                    ops,
+                    new_required,
+                    new_optional,
+                    new_model,
+                    new_frontier,
+                    linearization,
+                ) {
                     return true;
                 }
 
@@ -322,6 +421,21 @@ mod tests {
     /// Helper to create a read operation (default key "x")
     fn read_op(id: u64, value: Option<&str>, invoke: u64, complete: u64) -> Operation {
         read_op_key(id, "x", value, invoke, complete)
+    }
+
+    /// Helper to create an errored (indeterminate) write operation
+    fn error_write_op(id: u64, value: &str, invoke: u64, complete: u64) -> Operation {
+        Operation::new(
+            id,
+            ClientId(1),
+            "x".to_string(),
+            OpKind::Write {
+                value: value.to_string(),
+            },
+            Timestamp(invoke),
+            Timestamp(complete),
+            OpResult::Error("connection lost".to_string()),
+        )
     }
 
     #[test]
@@ -472,11 +586,6 @@ mod tests {
         history.add(read_op(3, Some("a"), 150, 250)); // Sees "a"
         history.add(read_op(4, Some("b"), 350, 450)); // Sees "b"
 
-        // This is NOT linearizable because:
-        // - R1 sees "a" means W(a) linearizes before R1
-        // - R2 sees "b" means W(b) linearizes after W(a) (so R2 sees the later value)
-        // - But R1 linearizes during [150,250] and must see the value at that point
-        // - If W(b) linearizes after R1 and before R2, this works!
         // Valid order: W(a), R1(a), W(b), R2(b)
         let result = LinearizabilityChecker::check(&history);
         assert!(result.is_linearizable);
@@ -642,5 +751,103 @@ mod tests {
         let result = LinearizabilityChecker::check(&history);
         assert!(result.is_linearizable);
         assert_eq!(result.linearization.unwrap().len(), 8);
+    }
+
+    // Indeterminate write tests
+
+    #[test]
+    fn test_indeterminate_write_value_read_later() {
+        // Scenario: Write "a" errors (indeterminate), but later read sees "a".
+        // This is valid because the write may have been committed.
+        let mut history = History::new();
+        history.add(error_write_op(1, "a", 0, 100)); // Indeterminate
+        history.add(read_op(2, Some("a"), 200, 300)); // Sees "a"
+
+        let result = LinearizabilityChecker::check(&history);
+        assert!(
+            result.is_linearizable,
+            "Indeterminate write followed by read of that value should be linearizable: {:?}",
+            result.error
+        );
+    }
+
+    #[test]
+    fn test_indeterminate_write_not_read() {
+        // Scenario: Write "a" errors, but later read sees None (initial state).
+        // This is valid because the write may NOT have been committed.
+        let mut history = History::new();
+        history.add(error_write_op(1, "a", 0, 100)); // Indeterminate
+        history.add(read_op(2, None, 200, 300)); // Sees None
+
+        let result = LinearizabilityChecker::check(&history);
+        assert!(
+            result.is_linearizable,
+            "Indeterminate write followed by read of None should be linearizable: {:?}",
+            result.error
+        );
+    }
+
+    #[test]
+    fn test_indeterminate_write_then_confirmed_write() {
+        // Scenario: Indeterminate write "a", then confirmed write "b", then read "b".
+        // Valid: the indeterminate write may or may not have happened,
+        // but the confirmed write "b" is the latest.
+        let mut history = History::new();
+        history.add(error_write_op(1, "a", 0, 100)); // Indeterminate
+        history.add(write_op(2, "b", 200, 300)); // Confirmed
+        history.add(read_op(3, Some("b"), 400, 500)); // Sees "b"
+
+        let result = LinearizabilityChecker::check(&history);
+        assert!(
+            result.is_linearizable,
+            "Should be linearizable: {:?}",
+            result.error
+        );
+    }
+
+    #[test]
+    fn test_indeterminate_write_overrides_confirmed() {
+        // Scenario: Confirmed write "a", then indeterminate write "b", then read "b".
+        // Valid: the indeterminate write may have committed after the confirmed one.
+        let mut history = History::new();
+        history.add(write_op(1, "a", 0, 100)); // Confirmed
+        history.add(error_write_op(2, "b", 200, 300)); // Indeterminate
+        history.add(read_op(3, Some("b"), 400, 500)); // Sees "b"
+
+        let result = LinearizabilityChecker::check(&history);
+        assert!(
+            result.is_linearizable,
+            "Indeterminate write overriding confirmed should be linearizable: {:?}",
+            result.error
+        );
+    }
+
+    #[test]
+    fn test_indeterminate_write_does_not_excuse_impossible_read() {
+        // Scenario: Confirmed write "a", read "c" (never written, not even indeterminate).
+        // Should still fail.
+        let mut history = History::new();
+        history.add(write_op(1, "a", 0, 100));
+        history.add(error_write_op(2, "b", 200, 300)); // Indeterminate but writes "b"
+        history.add(read_op(3, Some("c"), 400, 500)); // "c" never written
+
+        let result = LinearizabilityChecker::check(&history);
+        assert!(!result.is_linearizable);
+    }
+
+    #[test]
+    fn test_multiple_indeterminate_writes() {
+        // Multiple indeterminate writes with a read that sees one of them
+        let mut history = History::new();
+        history.add(error_write_op(1, "a", 0, 100)); // Indeterminate
+        history.add(error_write_op(2, "b", 50, 150)); // Indeterminate
+        history.add(read_op(3, Some("b"), 200, 300)); // Sees "b"
+
+        let result = LinearizabilityChecker::check(&history);
+        assert!(
+            result.is_linearizable,
+            "Multiple indeterminate writes should be linearizable: {:?}",
+            result.error
+        );
     }
 }

@@ -6,6 +6,7 @@
 
 pub mod checker;
 pub mod client;
+pub mod docker;
 pub mod history;
 pub mod runner;
 

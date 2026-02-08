@@ -52,7 +52,7 @@ struct ErrorResponse {
 /// HTTP test client that records operations to a shared History
 pub struct TestClient {
     /// Unique client identifier
-    client_id: ClientId,
+    pub(crate) client_id: ClientId,
     /// Node addresses for failover (format: "host:port")
     targets: Vec<String>,
     /// HTTP client
@@ -72,9 +72,11 @@ impl TestClient {
         targets: Vec<String>,
         history: Arc<Mutex<History>>,
         op_counter: Arc<AtomicU64>,
+        request_timeout: Duration,
     ) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_millis(500))
+            .timeout(request_timeout)
             .build()
             .expect("Failed to create HTTP client");
 
@@ -84,7 +86,7 @@ impl TestClient {
             http,
             history,
             next_op_id: op_counter,
-            max_retries: 5,
+            max_retries: 10,
         }
     }
 
@@ -290,7 +292,7 @@ mod tests {
         let counter = Arc::new(AtomicU64::new(1));
         let targets = vec!["127.0.0.1:8080".to_string()];
 
-        let client = TestClient::new(ClientId::new(1), targets, history, counter);
+        let client = TestClient::new(ClientId::new(1), targets, history, counter, Duration::from_secs(2));
         assert_eq!(client.client_id, ClientId::new(1));
         assert_eq!(client.targets.len(), 1);
     }
@@ -301,7 +303,7 @@ mod tests {
         let counter = Arc::new(AtomicU64::new(1));
         let targets = vec!["127.0.0.1:8080".to_string()];
 
-        let client = TestClient::new(ClientId::new(1), targets, history, counter.clone());
+        let client = TestClient::new(ClientId::new(1), targets, history, counter.clone(), Duration::from_secs(2));
 
         assert_eq!(client.next_id(), 1);
         assert_eq!(client.next_id(), 2);

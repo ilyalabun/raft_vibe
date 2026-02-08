@@ -879,6 +879,55 @@ All 253 tests pass.
 
 ---
 
+## Day 15 (continued): Docker-based Chaos Testing
+
+**Prompt:** "Implement Docker-based chaos testing that injects real failures and verifies linearizability"
+
+**Docker Infrastructure**
+
+Created `Dockerfile` (multi-stage build with `iproute2` and `iptables` for network manipulation) and `docker-compose.chaos.yml` defining a 5-node cluster on a custom bridge network. Each container runs a Raft node with `CAP_NET_ADMIN` for network fault injection. API ports are mapped to host ports 9101-9105.
+
+**DockerCluster Management**
+
+Created `chaos-test/src/docker.rs` with a `DockerCluster` struct providing:
+- Lifecycle: `start()` (tears down stale containers, builds images, starts fresh), `stop()`, `Drop` safety net
+- Node crashes: `kill_node()`, `start_node()`, `kill_leader()`
+- Network partitions: `isolate_node()` / `rejoin_node()` via `docker network disconnect/connect`
+- Granular partitions: `partition()` / `heal_partition()` via `iptables` inside containers
+- Latency injection: `add_latency()`, `add_packet_loss()`, `clear_netem()` via `tc`/`netem`
+
+**Fixing Server Event Loop Blocking**
+
+Discovered that `replicate_to_peers()`, `request_votes()`, and `send_heartbeat()` in `raft_node.rs` used `futures::future::join_all()` which waits for ALL peers including dead ones, blocking the entire `tokio::select!` event loop. Replaced with `FuturesUnordered` which yields results as futures complete:
+- `request_votes()`: Early return when node becomes leader (majority votes)
+- `replicate_to_peers()`: Early return when entry is committed (majority replication)
+- `send_heartbeat()`: Processes all results (no early return - needed for correctness)
+- Event loop heartbeat wrapped in `tokio::time::timeout(heartbeat_interval)` to prevent blocking
+
+**Fixing Read Path Blocking**
+
+The `handle_read_index()` method called `send_heartbeat()` which waits for all peers. Created a new `confirm_leadership()` method that sends lightweight empty AppendEntries and returns early once a majority responds - used specifically for the ReadIndex protocol's leadership confirmation step.
+
+**WGL Checker: Indeterminate Write Handling**
+
+When a leader is killed, writes that committed but whose response was lost appear as errors. Later reads may return these values. Extended the checker to handle indeterminate (errored) writes as optional operations: they can be included in the linearization (with their time interval extended to the end of the history) or skipped entirely. The search succeeds when all required (confirmed) operations are placed.
+
+**WGL Checker: Performance Optimization**
+
+The checker was hanging on 250+ operations due to exponential branching in the search. Added the `min_complete` pruning optimization: find the earliest `complete_ts` among remaining required operations, and only consider operations invoked before this deadline as candidates. This is the key WGL optimization that dramatically reduces the search space.
+
+**8 Chaos Test Scenarios**
+
+Created `tests/chaos_linearizability_test.rs` with 8 test scenarios (all marked `#[ignore]`, require Docker):
+- Leader kill, follower kill, two followers kill
+- Minority partition, leader partition, partition heal
+- Slow network (50ms latency on 2 nodes)
+- Rolling restart (kill/restart each node in sequence)
+
+All 8 tests pass with linearizability verified under all chaos conditions.
+
+---
+
 ## Next Up
 
 - Potential future work: Dynamic cluster membership, cluster configuration changes

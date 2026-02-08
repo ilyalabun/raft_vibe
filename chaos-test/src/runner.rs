@@ -27,6 +27,8 @@ pub struct TestConfig {
     pub keys: Vec<String>,
     /// Ratio of writes (0.0 = all reads, 1.0 = all writes)
     pub write_ratio: f64,
+    /// Per-request HTTP timeout
+    pub request_timeout: Duration,
 }
 
 impl Default for TestConfig {
@@ -41,6 +43,7 @@ impl Default for TestConfig {
             ops_per_client: 50,
             keys: vec!["x".to_string()],
             write_ratio: 0.5,
+            request_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -94,6 +97,7 @@ pub async fn run_test(config: TestConfig) -> TestResult {
             config.node_addresses.clone(),
             history.clone(),
             op_counter.clone(),
+            config.request_timeout,
         );
 
         let keys = config.keys.clone();
@@ -110,21 +114,25 @@ pub async fn run_test(config: TestConfig) -> TestResult {
         let _ = handle.await;
     }
 
-    let duration = start.elapsed();
+    let workload_duration = start.elapsed();
+    println!("[run_test] Workload completed in {:?}", workload_duration);
 
     // Extract history for checking
     let final_history = history.lock().clone();
     let total_ops = final_history.len();
     let successful_ops = final_history.successful_ops().len();
+    println!("[run_test] History: {} total ops, {} successful", total_ops, successful_ops);
 
     // Run linearizability checker
+    let check_start = Instant::now();
     let check = LinearizabilityChecker::check(&final_history);
+    println!("[run_test] Linearizability check completed in {:?}", check_start.elapsed());
 
     TestResult {
         check,
         total_ops,
         successful_ops,
-        duration,
+        duration: workload_duration,
         history: final_history,
     }
 }
@@ -145,7 +153,7 @@ async fn run_client_workload(client: TestClient, keys: &[String], ops: usize, wr
         if is_write {
             // Generate unique value for this client's writes
             value_counter += 1;
-            let value = format!("v{}", value_counter);
+            let value = format!("c{}_v{}", client.client_id.0, value_counter);
             let _ = client.write(key, &value).await;
         } else {
             let _ = client.read(key).await;

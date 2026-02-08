@@ -33,6 +33,7 @@ impl HttpTransport {
     /// Create a new HTTP transport with peer addresses
     pub fn new(peers: HashMap<u64, String>, timeout: Duration) -> Self {
         let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(1))
             .timeout(timeout)
             .build()
             .expect("Failed to create HTTP client");

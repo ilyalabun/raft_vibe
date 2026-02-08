@@ -3,6 +3,9 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
+
 use super::raft_core::{AppendEntriesArgs, InstallSnapshotArgs, RaftCore, RaftState, RequestVoteArgs};
 use crate::transport::Transport;
 
@@ -49,8 +52,8 @@ impl<T: Transport> RaftNode<T> {
             (args, core.peers.clone())
         };
 
-        // Send all vote requests concurrently
-        let futures: Vec<_> = peers
+        // Send all vote requests concurrently, process as they arrive
+        let mut futures: FuturesUnordered<_> = peers
             .iter()
             .map(|&peer_id| {
                 let args = args.clone();
@@ -59,14 +62,11 @@ impl<T: Transport> RaftNode<T> {
             })
             .collect();
 
-        let results = futures::future::join_all(futures).await;
-
-        // Process results
-        for (peer_id, result) in results {
+        while let Some((peer_id, result)) = futures.next().await {
             if let Ok(result) = result {
                 let mut core = self.core.lock().await;
                 if core.handle_request_vote_result(peer_id, &result) {
-                    return true; // Became leader
+                    return true; // Became leader, don't wait for remaining
                 }
             }
         }
@@ -120,8 +120,8 @@ impl<T: Transport> RaftNode<T> {
             requests_to_send
         };
 
-        // Send to all peers concurrently (lock released)
-        let futures: Vec<_> = requests_to_send
+        // Send to all peers concurrently, process as they arrive (lock released)
+        let mut futures: FuturesUnordered<_> = requests_to_send
             .into_iter()
             .map(|(peer_id, args)| {
                 let transport = &self.transport;
@@ -129,20 +129,20 @@ impl<T: Transport> RaftNode<T> {
             })
             .collect();
 
-        let results = futures::future::join_all(futures).await;
-
-        // Process results and find our entry's result
+        // Process results as they arrive - return as soon as entry is committed
         let mut entry_result = None;
-        for (peer_id, result) in results {
+        while let Some((peer_id, result)) = futures.next().await {
             if let Ok(result) = result {
                 let mut core = self.core.lock().await;
                 let (_committed, apply_results) = core.handle_append_entries_result(peer_id, entry_index, &result);
-                // Look for our entry's result
                 for (idx, res) in apply_results {
                     if idx == entry_index {
                         entry_result = Some(res);
                     }
                 }
+            }
+            if entry_result.is_some() {
+                break; // Entry committed, don't wait for remaining peers
             }
         }
         entry_result
@@ -245,7 +245,7 @@ impl<T: Transport> RaftNode<T> {
             InstallSnapshot(Result<crate::core::raft_core::InstallSnapshotResult, crate::transport::TransportError>, u64), // last_included_index
         }
 
-        let futures: Vec<_> = requests_to_send
+        let mut futures: FuturesUnordered<_> = requests_to_send
             .into_iter()
             .map(|(peer_id, request)| {
                 let transport = &self.transport;
@@ -265,11 +265,9 @@ impl<T: Transport> RaftNode<T> {
             })
             .collect();
 
-        let results = futures::future::join_all(futures).await;
-
-        // Process results and count successes
+        // Process all results (wait for every peer so we catch higher terms and replicate fully)
         let mut success_count = 0;
-        for (peer_id, result_type) in results {
+        while let Some((peer_id, result_type)) = futures.next().await {
             match result_type {
                 ResultType::AppendEntries(result, last_entry_index) => {
                     if let Ok(append_result) = result {
@@ -283,14 +281,12 @@ impl<T: Transport> RaftNode<T> {
                     if let Ok(snapshot_result) = result {
                         match snapshot_result {
                             InstallSnapshotResult::Success { term: _ } => {
-                                // Update next_index and match_index for the peer
                                 let mut core = self.core.lock().await;
                                 core.next_index.insert(peer_id, last_included_index + 1);
                                 core.match_index.insert(peer_id, last_included_index);
                                 success_count += 1;
                             }
                             InstallSnapshotResult::Failed { term, reason: _ } => {
-                                // If peer has higher term, step down
                                 let mut core = self.core.lock().await;
                                 if term > core.current_term {
                                     core.current_term = term;
@@ -304,7 +300,77 @@ impl<T: Transport> RaftNode<T> {
             }
         }
 
-        // Return whether we're still leader and how many peers responded successfully
+        let still_leader = self.core.lock().await.state == RaftState::Leader;
+        (still_leader, success_count)
+    }
+
+    /// Confirm leadership by sending heartbeats to peers.
+    /// Returns (still_leader, success_count) as soon as a majority responds,
+    /// without waiting for slow/dead peers. Used by ReadIndex protocol.
+    pub async fn confirm_leadership(&self) -> (bool, usize) {
+        // Build lightweight heartbeats (empty AppendEntries)
+        let requests = {
+            let core = self.core.lock().await;
+            if core.state != RaftState::Leader {
+                return (false, 0);
+            }
+            let mut requests = Vec::new();
+            for &peer_id in &core.peers {
+                let next_idx = core.next_index.get(&peer_id).copied().unwrap_or(1);
+                let prev_log_index = next_idx - 1;
+                let prev_log_term = if prev_log_index == core.snapshot_last_index {
+                    core.snapshot_last_term
+                } else if prev_log_index == 0 {
+                    0
+                } else if prev_log_index > core.snapshot_last_index {
+                    let pos = (prev_log_index - core.snapshot_last_index - 1) as usize;
+                    core.log.get(pos).map(|e| e.term).unwrap_or(0)
+                } else {
+                    0
+                };
+                let args = AppendEntriesArgs {
+                    term: core.current_term,
+                    leader_id: core.id,
+                    prev_log_index,
+                    prev_log_term,
+                    entries: vec![],
+                    leader_commit: core.commit_index,
+                };
+                requests.push((peer_id, args));
+            }
+            requests
+        };
+
+        let num_peers = requests.len();
+        let majority_needed = (num_peers + 1) / 2;
+
+        let mut futures: FuturesUnordered<_> = requests
+            .into_iter()
+            .map(|(peer_id, args)| {
+                let transport = &self.transport;
+                async move { (peer_id, transport.append_entries(peer_id, args).await) }
+            })
+            .collect();
+
+        let mut success_count = 0;
+        while let Some((_peer_id, result)) = futures.next().await {
+            if let Ok(result) = result {
+                let mut core = self.core.lock().await;
+                if result.term > core.current_term {
+                    core.current_term = result.term;
+                    core.state = RaftState::Follower;
+                    core.voted_for = None;
+                    return (false, success_count);
+                }
+                if result.success {
+                    success_count += 1;
+                }
+            }
+            if success_count >= majority_needed {
+                break;
+            }
+        }
+
         let still_leader = self.core.lock().await.state == RaftState::Leader;
         (still_leader, success_count)
     }

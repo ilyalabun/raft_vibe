@@ -195,14 +195,18 @@ chaos-test/                   # Linearizability testing framework
 │   ├── history.rs          # Operation history types
 │   ├── checker.rs          # WGL linearizability checker
 │   ├── client.rs           # HTTP test client
-│   └── runner.rs           # Test orchestration
+│   ├── runner.rs           # Test orchestration
+│   └── docker.rs           # Docker cluster management
 └── tests/
     └── checker_test.rs     # WGL checker unit tests
+
+Dockerfile                    # Multi-stage build for raft-server
+docker-compose.chaos.yml      # 5-node cluster for chaos testing
 ```
 
 ## Linearizability Testing
 
-The project includes a Jepsen-like testing framework (`chaos-test` crate) that verifies the cluster maintains linearizability under concurrent operations.
+The project includes a Jepsen-like testing framework (`chaos-test` crate) that verifies the cluster maintains linearizability under concurrent operations, including under real failure conditions.
 
 ### What is Linearizability?
 
@@ -216,6 +220,9 @@ cargo test --test linearizability_test
 
 # Run WGL checker unit tests
 cargo test --package chaos-test
+
+# Run Docker-based chaos tests (requires Docker)
+cargo test --test chaos_linearizability_test -- --ignored --nocapture --test-threads=1
 ```
 
 ### The WGL Checker
@@ -226,7 +233,7 @@ The `chaos-test` crate implements the Wing-Gong Linearizability (WGL) algorithm 
 2. Finding a valid linearization - an ordering where each operation could have taken effect atomically
 3. Verifying reads return values consistent with the write ordering
 
-The checker handles concurrent operations by exploring all valid orderings where operations overlap in time.
+The checker handles concurrent operations by exploring all valid orderings where operations overlap in time. It also supports indeterminate (errored) writes that may or may not have been committed - these are treated as optional in the linearization search.
 
 ### Test Workloads
 
@@ -236,6 +243,25 @@ The linearizability tests spin up a 3-node cluster and run concurrent clients pe
 - `test_high_concurrency` - 10 clients, 20 ops each, stress test
 - `test_write_heavy` - 80% writes, stress write ordering
 - `test_read_heavy` - 80% reads, stress read consistency
+
+### Docker Chaos Tests
+
+The chaos tests run a 5-node Raft cluster in Docker containers and inject real failures while verifying linearizability is maintained. Each test starts a fresh cluster, runs concurrent client operations alongside chaos injection, then checks that all operations are linearizable.
+
+**Prerequisites:** Docker and Docker Compose
+
+| Test | Chaos Action | Validates |
+|------|-------------|-----------|
+| `test_leader_kill` | Kill leader node | New leader elected, linearizable |
+| `test_follower_kill` | Kill one follower | Cluster continues, linearizable |
+| `test_two_followers_kill` | Kill two followers | 3/5 majority continues, linearizable |
+| `test_minority_partition` | Isolate 2 nodes from network | Majority partition continues |
+| `test_leader_partition` | Isolate leader from network | New leader elected, linearizable |
+| `test_partition_heal` | Partition then heal after 2s | Cluster recovers, linearizable |
+| `test_slow_network` | Add 50ms latency to 2 nodes | Operations slower but linearizable |
+| `test_rolling_restart` | Kill/restart nodes one at a time | Cluster stays available |
+
+Failure injection uses real Linux tools: `docker network disconnect/connect` for network partitions, `docker kill/start` for node crashes, and `tc netem` for latency injection.
 
 ## Resources
 

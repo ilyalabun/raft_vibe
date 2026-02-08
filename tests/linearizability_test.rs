@@ -23,6 +23,7 @@ async fn test_healthy_cluster() {
         ops_per_client: 50,
         keys: vec!["x".to_string()],
         write_ratio: 0.5,
+        ..TestConfig::default()
     };
 
     let result = run_test(config).await;
@@ -64,6 +65,7 @@ async fn test_high_concurrency() {
         ops_per_client: 20,
         keys: vec!["stress".to_string()],
         write_ratio: 0.5,
+        ..TestConfig::default()
     };
 
     let result = run_test(config).await;
@@ -97,6 +99,7 @@ async fn test_write_heavy() {
         ops_per_client: 30,
         keys: vec!["writeheavy".to_string()],
         write_ratio: 0.8,
+        ..TestConfig::default()
     };
 
     let result = run_test(config).await;
@@ -130,6 +133,7 @@ async fn test_read_heavy() {
         ops_per_client: 30,
         keys: vec!["readheavy".to_string()],
         write_ratio: 0.2,
+        ..TestConfig::default()
     };
 
     let result = run_test(config).await;
@@ -167,6 +171,7 @@ async fn test_multiple_keys() {
             "key3".to_string(),
         ],
         write_ratio: 0.5,
+        ..TestConfig::default()
     };
 
     let result = run_test(config).await;

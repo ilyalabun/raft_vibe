@@ -1,0 +1,118 @@
+services:
+  raft-node-1:
+    build: .
+    image: raft-server:chaos
+    container_name: raft-node-1
+    command:
+      - --id
+      - "1"
+      - --transport-port
+      - "8000"
+      - --api-port
+      - "9000"
+      - --data-dir
+      - /data
+      - --peers
+      - 2=raft-node-2:8000,3=raft-node-3:8000,4=raft-node-4:8000,5=raft-node-5:8000
+    ports:
+      - "9101:9000"
+    networks:
+      - raft-chaos-net
+    cap_add:
+      - NET_ADMIN
+
+  raft-node-2:
+    image: raft-server:chaos
+    container_name: raft-node-2
+    depends_on:
+      - raft-node-1
+    command:
+      - --id
+      - "2"
+      - --transport-port
+      - "8000"
+      - --api-port
+      - "9000"
+      - --data-dir
+      - /data
+      - --peers
+      - 1=raft-node-1:8000,3=raft-node-3:8000,4=raft-node-4:8000,5=raft-node-5:8000
+    ports:
+      - "9102:9000"
+    networks:
+      - raft-chaos-net
+    cap_add:
+      - NET_ADMIN
+
+  raft-node-3:
+    image: raft-server:chaos
+    container_name: raft-node-3
+    depends_on:
+      - raft-node-1
+    command:
+      - --id
+      - "3"
+      - --transport-port
+      - "8000"
+      - --api-port
+      - "9000"
+      - --data-dir
+      - /data
+      - --peers
+      - 1=raft-node-1:8000,2=raft-node-2:8000,4=raft-node-4:8000,5=raft-node-5:8000
+    ports:
+      - "9103:9000"
+    networks:
+      - raft-chaos-net
+    cap_add:
+      - NET_ADMIN
+
+  raft-node-4:
+    image: raft-server:chaos
+    container_name: raft-node-4
+    depends_on:
+      - raft-node-1
+    command:
+      - --id
+      - "4"
+      - --transport-port
+      - "8000"
+      - --api-port
+      - "9000"
+      - --data-dir
+      - /data
+      - --peers
+      - 1=raft-node-1:8000,2=raft-node-2:8000,3=raft-node-3:8000,5=raft-node-5:8000
+    ports:
+      - "9104:9000"
+    networks:
+      - raft-chaos-net
+    cap_add:
+      - NET_ADMIN
+
+  raft-node-5:
+    image: raft-server:chaos
+    container_name: raft-node-5
+    depends_on:
+      - raft-node-1
+    command:
+      - --id
+      - "5"
+      - --transport-port
+      - "8000"
+      - --api-port
+      - "9000"
+      - --data-dir
+      - /data
+      - --peers
+      - 1=raft-node-1:8000,2=raft-node-2:8000,3=raft-node-3:8000,4=raft-node-4:8000
+    ports:
+      - "9105:9000"
+    networks:
+      - raft-chaos-net
+    cap_add:
+      - NET_ADMIN
+
+networks:
+  raft-chaos-net:
+    driver: bridge

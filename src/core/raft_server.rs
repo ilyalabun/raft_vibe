@@ -163,7 +163,11 @@ impl<T: Transport + 'static> RaftServer<T> {
                     if self.node.state().await == RaftState::Leader {
                         // Update our own heartbeat timer to prevent election timeout
                         self.node.shared_core().lock().await.last_heartbeat = Instant::now();
-                        let _ = self.node.send_heartbeat().await;
+                        // Cap heartbeat wait so dead peers don't block the event loop
+                        let _ = tokio::time::timeout(
+                            self.config.heartbeat_interval,
+                            self.node.send_heartbeat(),
+                        ).await;
                     }
                 }
                 // Election timeout - start election if not leader
@@ -178,7 +182,10 @@ impl<T: Transport + 'static> RaftServer<T> {
 
                             if became_leader {
                                 // Immediately send heartbeat to establish leadership
-                                let _ = self.node.send_heartbeat().await;
+                                let _ = tokio::time::timeout(
+                                    self.config.heartbeat_interval,
+                                    self.node.send_heartbeat(),
+                                ).await;
                             }
                         }
                     }
@@ -245,8 +252,8 @@ impl<T: Transport + 'static> RaftServer<T> {
             (core.commit_index, core.peers.len())
         };
 
-        // Step 2: Send heartbeat to confirm leadership (need majority to respond)
-        let (still_leader, success_count) = self.node.send_heartbeat().await;
+        // Step 2: Confirm leadership with majority (returns early, doesn't wait for slow peers)
+        let (still_leader, success_count) = self.node.confirm_leadership().await;
 
         if !still_leader {
             let core = shared_core.lock().await;
