@@ -508,3 +508,73 @@ async fn test_packet_loss() {
     cluster.clear_netem(2).await;
     cluster.stop().await;
 }
+
+/// Kill a follower, wipe its storage, restart it. The node comes back with no
+/// persistent state and must catch up from the leader via snapshot/replication.
+/// Simulates a disk replacement.
+#[tokio::test]
+#[ignore]
+async fn test_storage_wipe() {
+
+    let cluster = DockerCluster::start(COMPOSE_FILE, NODE_COUNT).await;
+    let leader = cluster.wait_for_leader(LEADER_TIMEOUT).await;
+    assert!(leader.is_some(), "Cluster should elect a leader");
+    let leader_id = leader.unwrap();
+
+    let config = chaos_test_config(&cluster);
+
+    // Pick a non-leader node to wipe
+    let victim = if leader_id == 1 { 2 } else { 1 };
+
+    let (result, _) = tokio::join!(run_test(config), async {
+        // Let some operations commit first so there's state to recover
+        sleep(Duration::from_millis(500)).await;
+        cluster.kill_node(victim).await;
+        cluster.wipe_node_storage(victim).await;
+        cluster.start_node(victim).await;
+        println!("Node {} restarted with wiped storage", victim);
+        cluster.wait_for_leader(LEADER_TIMEOUT).await;
+    });
+
+    println!(
+        "Storage wipe: {} total, {} successful, linearizable: {}",
+        result.total_ops, result.successful_ops, result.check.is_linearizable
+    );
+
+    assert!(
+        result.check.is_linearizable,
+        "Should be linearizable after storage wipe: {:?}",
+        result.check.error
+    );
+    assert!(
+        result.successful_ops > result.total_ops / 2,
+        "Most ops should succeed: {} / {}",
+        result.successful_ops,
+        result.total_ops
+    );
+
+    // Verify the wiped node caught up with the leader
+    let leader_id = cluster.find_leader().await.expect("Should have a leader") as usize;
+    let leader_status = cluster.get_node_status(leader_id).await
+        .expect("Leader should be reachable");
+
+    // Poll until the wiped node's commit_index matches the leader's
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut caught_up = false;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(victim_status) = cluster.get_node_status(victim).await {
+            println!(
+                "Catch-up check: leader commit_index={}, victim commit_index={}",
+                leader_status.commit_index, victim_status.commit_index
+            );
+            if victim_status.commit_index >= leader_status.commit_index {
+                caught_up = true;
+                break;
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    assert!(caught_up, "Wiped node should catch up to leader's commit_index");
+
+    cluster.stop().await;
+}

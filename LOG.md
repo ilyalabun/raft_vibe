@@ -928,6 +928,37 @@ All 8 tests pass with linearizability verified under all chaos conditions.
 
 ---
 
+## Day 16: Conflict Hint Optimization and Gap Log Bug Fix
+
+**Prompt:** "Let's write a storage wipe chaos test"
+
+**Starting with the Storage Wipe Test**
+
+Wrote `test_storage_wipe` — a chaos test that kills a node, wipes its persistent storage, restarts it, and verifies the wiped node catches up from the leader. The test revealed that catch-up was extremely slow: the leader walks `next_index` back by 1 per heartbeat cycle (150ms), so catching up ~250 entries took ~37 seconds. This motivated implementing the conflict hint optimization from Raft Section 5.3.
+
+**Conflict Hint Optimization (Raft Section 5.3)**
+
+Extended `AppendEntriesResult` with two optional fields: `conflict_term` (the term of the conflicting entry) and `conflict_index` (first index of the conflicting term, or follower's log end if too short). When a follower rejects an AppendEntries, it now tells the leader exactly where the conflict starts, allowing the leader to jump `next_index` back in a single round trip instead of decrementing by 1.
+
+Added `find_first_index_for_term()` and `find_last_index_for_term()` helpers. Populated conflict hints across all 5 rejection paths in `handle_append_entries()`. Updated the leader's `handle_append_entries_result()` to use these hints. Added 6 unit tests for conflict hint behavior.
+
+**Discovering the Gap Log Bug**
+
+The `test_storage_wipe` chaos test still failed after implementing conflict hints. After extensive debugging with Docker, added diagnostic logging and wrote unit tests to reproduce the issue without Docker. The `test_conflict_hint_gap_log` test confirmed the bug: the `wipe_node_storage()` procedure had a race condition — it started the container (running the raft-server), ran `rm -rf /data/*`, then killed it. Between `rm` and `kill`, the raft-server wrote new entries to `/data`, creating a "gap log" — entries at high indices (e.g., 229+) with no preceding entries and no snapshot.
+
+This gap log caused an infinite loop: `get_log_entry()` returned `None` for all indices (offset calculation assumes contiguous entries), and the conflict hint returned `last_log_index() + 1` which was HIGHER than the leader's `next_index`, causing it to go UP instead of down.
+
+**Fixing the Gap Log Bug (Defense in Depth)**
+
+Applied three complementary fixes:
+1. **Follower side:** When `get_log_entry()` returns `None` for an index within the log range (gap detected), return `conflict_index = snapshot_last_index + 1` instead of `last_log_index() + 1`, telling the leader to start from the beginning.
+2. **Leader side:** Added a safety guard ensuring `next_index` can never increase on a rejection — capped at `current_next - 1`.
+3. **Wipe procedure:** Replaced the racy start→exec rm→kill approach with `docker rm` + `docker compose create`, which recreates the container with a guaranteed-clean filesystem.
+
+All 13 chaos tests pass, including `test_storage_wipe` which now catches up instantly (1-2 round trips instead of hundreds).
+
+---
+
 ## Next Up
 
 - Potential future work: Dynamic cluster membership, cluster configuration changes

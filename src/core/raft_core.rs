@@ -83,6 +83,12 @@ pub struct AppendEntriesResult {
     pub term: u64,
     /// True if follower contained entry matching prev_log_index and prev_log_term
     pub success: bool,
+    /// Term of the conflicting entry (None if log is too short or stale term)
+    #[serde(default)]
+    pub conflict_term: Option<u64>,
+    /// First index of conflict_term, or follower's last_log_index + 1 if log too short
+    #[serde(default)]
+    pub conflict_index: Option<u64>,
 }
 
 /// Result of handling an AppendEntries RPC
@@ -298,6 +304,44 @@ impl RaftCore {
         }
     }
 
+    /// Find the first index with the given term in the follower's log,
+    /// scanning backwards from `from_index`. Used for conflict hints.
+    fn find_first_index_for_term(&self, term: u64, from_index: u64) -> u64 {
+        let mut idx = from_index;
+        while idx > self.snapshot_last_index + 1 {
+            if let Some(entry) = self.get_log_entry(idx - 1) {
+                if entry.term == term {
+                    idx -= 1;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        idx
+    }
+
+    /// Find the last index with the given term in the leader's log.
+    /// Used by the leader to process conflict hints from followers.
+    fn find_last_index_for_term(&self, term: u64) -> Option<u64> {
+        // Check in-memory log entries (backwards)
+        for entry in self.log.iter().rev() {
+            if entry.term == term {
+                return Some(entry.index);
+            }
+            // Optimization: if we've passed the term going backwards, stop
+            if entry.term < term {
+                break;
+            }
+        }
+        // Check snapshot boundary
+        if self.snapshot_last_term == term && self.snapshot_last_index > 0 {
+            return Some(self.snapshot_last_index);
+        }
+        None
+    }
+
     /// Check if candidate's log is at least as up-to-date as receiver's log
     /// Returns true if:
     /// - candidate's last log term > receiver's last log term, OR
@@ -370,9 +414,11 @@ impl RaftCore {
         }
 
         let mut leader_id = None;
+        let mut conflict_term: Option<u64> = None;
+        let mut conflict_index: Option<u64> = None;
 
         let success = if append_req.term < self.current_term {
-            // Reply false if term < currentTerm
+            // Reply false if term < currentTerm (stale leader, no hint needed)
             false
         } else {
             // Valid AppendEntries from current leader - reset election timeout
@@ -386,11 +432,15 @@ impl RaftCore {
 
                 // If current log is not up-to-date, return false
                 if append_req.prev_log_index > self.last_log_index() {
+                    // Log too short — tell leader where our log ends
+                    conflict_index = Some(self.last_log_index() + 1);
                     false
                 } else if append_req.prev_log_index == self.snapshot_last_index {
                     // prev_log_index is exactly at snapshot boundary
                     // Check that the term matches the snapshot
                     if append_req.prev_log_term != self.snapshot_last_term {
+                        conflict_term = Some(self.snapshot_last_term);
+                        conflict_index = Some(self.snapshot_last_index);
                         false
                     } else {
                         // Process each new entry
@@ -413,6 +463,10 @@ impl RaftCore {
                     // Need to find it in the log (accounting for snapshot offset)
                     if let Some(entry) = self.get_log_entry(append_req.prev_log_index) {
                         if entry.term != append_req.prev_log_term {
+                            // Term mismatch — find first index of the conflicting term
+                            let ct = entry.term;
+                            conflict_term = Some(ct);
+                            conflict_index = Some(self.find_first_index_for_term(ct, append_req.prev_log_index));
                             false
                         } else {
                             // Process each new entry
@@ -431,7 +485,11 @@ impl RaftCore {
                             true
                         }
                     } else {
-                        // Entry not found in log or snapshot
+                        // Entry not found in log — index is within last_log_index() range
+                        // but get_log_entry() returned None. This means the log is
+                        // corrupted (gap: entries at high indices but no snapshot).
+                        // Tell the leader to start from the beginning of our actual data.
+                        conflict_index = Some(self.snapshot_last_index + 1);
                         false
                     }
                 }
@@ -458,6 +516,8 @@ impl RaftCore {
             result: AppendEntriesResult {
                 term: self.current_term,
                 success,
+                conflict_term,
+                conflict_index,
             },
             leader_id,
         }
@@ -839,11 +899,26 @@ impl RaftCore {
                 self.next_index.insert(peer_id, entry_index + 1);
             }
         } else {
-            // Replication failed, decrement next_index for retry
+            // Replication failed — use conflict hint to jump back efficiently
+            let new_next = if let Some(conflict_term) = result.conflict_term {
+                // Follower has a conflicting term — find the last entry of that term in our log
+                // If found: set next_index past the end of that term
+                // If not found: jump to conflict_index (skip the entire conflicting term)
+                self.find_last_index_for_term(conflict_term)
+                    .map(|idx| idx + 1)
+                    .unwrap_or_else(|| result.conflict_index.unwrap_or(1))
+            } else if let Some(conflict_index) = result.conflict_index {
+                // No conflict term (log too short) — jump to follower's last index + 1
+                conflict_index
+            } else {
+                // No hint (stale term rejection) — fall back to decrement by 1
+                let current_next = self.next_index.get(&peer_id).copied().unwrap_or(1);
+                current_next.saturating_sub(1).max(1)
+            };
+            // Safety: on rejection, next_index must never increase — cap at current - 1
             let current_next = self.next_index.get(&peer_id).copied().unwrap_or(1);
-            if current_next > 1 {
-                self.next_index.insert(peer_id, current_next - 1);
-            }
+            let safe_next = new_next.max(1).min(current_next.saturating_sub(1).max(1));
+            self.next_index.insert(peer_id, safe_next);
         }
 
         // Check if entry_index is replicated to majority and can be committed
@@ -1164,6 +1239,8 @@ mod tests {
         let result = AppendEntriesResult {
             term: 5,
             success: false,
+            conflict_term: None,
+            conflict_index: None,
         };
         node.process_append_entries_response(&result);
 
@@ -1490,10 +1567,12 @@ mod tests {
         // Initialize next_index for peer 2 (assume it's at index 5)
         leader.next_index.insert(2, 5);
 
-        // Peer rejects AppendEntries (log mismatch)
+        // Peer rejects AppendEntries (no conflict hint — stale term path)
         let result = AppendEntriesResult {
             term: 1,
             success: false,
+            conflict_term: None,
+            conflict_index: None,
         };
         leader.handle_append_entries_result(2, 5, &result);
 
@@ -1510,10 +1589,12 @@ mod tests {
         // next_index is already at 1
         leader.next_index.insert(2, 1);
 
-        // Peer rejects AppendEntries
+        // Peer rejects AppendEntries (no conflict hint)
         let result = AppendEntriesResult {
             term: 1,
             success: false,
+            conflict_term: None,
+            conflict_index: None,
         };
         leader.handle_append_entries_result(2, 1, &result);
 
@@ -1540,6 +1621,8 @@ mod tests {
         let result = AppendEntriesResult {
             term: 1,
             success: true,
+            conflict_term: None,
+            conflict_index: None,
         };
         leader.handle_append_entries_result(2, 1, &result);
 
@@ -1562,6 +1645,8 @@ mod tests {
         let result = AppendEntriesResult {
             term: 1,
             success: true,
+            conflict_term: None,
+            conflict_index: None,
         };
         leader.handle_append_entries_result(2, 3, &result);
 
@@ -1584,6 +1669,8 @@ mod tests {
         let result = AppendEntriesResult {
             term: 1,
             success: true,
+            conflict_term: None,
+            conflict_index: None,
         };
         let (committed, _) = leader.handle_append_entries_result(2, 1, &result);
 
@@ -1605,6 +1692,8 @@ mod tests {
         let result = AppendEntriesResult {
             term: 1,
             success: true,
+            conflict_term: None,
+            conflict_index: None,
         };
 
         // Peer 2 replicates (2 total)
@@ -1635,6 +1724,8 @@ mod tests {
         let result = AppendEntriesResult {
             term: 1,
             success: true,
+            conflict_term: None,
+            conflict_index: None,
         };
 
         // Peer 2 replicates up to index 3
@@ -1661,6 +1752,8 @@ mod tests {
         let result = AppendEntriesResult {
             term: 5,
             success: false,
+            conflict_term: None,
+            conflict_index: None,
         };
         let (committed, _) = leader.handle_append_entries_result(2, 1, &result);
 
@@ -1721,6 +1814,8 @@ mod tests {
         let result = AppendEntriesResult {
             term: 2,
             success: true,
+            conflict_term: None,
+            conflict_index: None,
         };
         let (committed, _) = leader.handle_append_entries_result(2, 1, &result);
 
@@ -1757,6 +1852,8 @@ mod tests {
         let result = AppendEntriesResult {
             term: 2,
             success: true,
+            conflict_term: None,
+            conflict_index: None,
         };
         let (committed, _) = leader.handle_append_entries_result(2, 2, &result);
 
@@ -2054,6 +2151,8 @@ mod tests {
         let stale_result = AppendEntriesResult {
             term: 3,
             success: true,
+            conflict_term: None,
+            conflict_index: None,
         };
         let _ = leader.handle_append_entries_result(2, 1, &stale_result);
 
@@ -3227,5 +3326,288 @@ mod tests {
         // Should still have exactly 5 entries (no duplicates)
         assert_eq!(follower.log.len(), 5);
         assert_eq!(follower.log[4].index, snapshot_idx + 5);
+    }
+
+    // === Conflict Hint Tests ===
+
+    #[test]
+    fn test_conflict_hint_log_too_short() {
+        // Follower log is shorter than prev_log_index — should return conflict_index = last_log_index + 1
+        let mut follower = new_test_core(1, vec![2, 3]);
+        follower.current_term = 1;
+        // Follower has 2 entries
+        follower.log.push(LogEntry { term: 1, index: 1, command: "CMD 1".to_string() });
+        follower.log.push(LogEntry { term: 1, index: 2, command: "CMD 2".to_string() });
+
+        // Leader sends AppendEntries with prev_log_index=5 (follower only has up to 2)
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 5,
+            prev_log_term: 1,
+            entries: vec![],
+            leader_commit: 0,
+        };
+        let output = follower.handle_append_entries(&args);
+
+        assert!(!output.result.success);
+        assert_eq!(output.result.conflict_term, None);
+        assert_eq!(output.result.conflict_index, Some(3)); // last_log_index + 1
+
+        // Leader should jump next_index to 3
+        let mut leader = new_test_core(2, vec![1, 3]);
+        leader.current_term = 1;
+        leader.state = RaftState::Leader;
+        leader.next_index.insert(1, 6);
+        leader.handle_append_entries_result(1, 5, &output.result);
+        assert_eq!(leader.next_index.get(&1), Some(&3));
+    }
+
+    #[test]
+    fn test_conflict_hint_term_mismatch() {
+        // Follower has entries with a different term — leader should skip past the conflicting term
+        let mut follower = new_test_core(1, vec![2, 3]);
+        follower.current_term = 3;
+        // Follower has entries: [term=1@1, term=2@2, term=2@3, term=2@4]
+        follower.log.push(LogEntry { term: 1, index: 1, command: "CMD 1".to_string() });
+        follower.log.push(LogEntry { term: 2, index: 2, command: "CMD 2".to_string() });
+        follower.log.push(LogEntry { term: 2, index: 3, command: "CMD 3".to_string() });
+        follower.log.push(LogEntry { term: 2, index: 4, command: "CMD 4".to_string() });
+
+        // Leader sends prev_log_index=4, prev_log_term=3 (follower has term=2 at index 4)
+        let args = AppendEntriesArgs {
+            term: 3,
+            leader_id: 2,
+            prev_log_index: 4,
+            prev_log_term: 3,
+            entries: vec![],
+            leader_commit: 0,
+        };
+        let output = follower.handle_append_entries(&args);
+
+        assert!(!output.result.success);
+        assert_eq!(output.result.conflict_term, Some(2));
+        assert_eq!(output.result.conflict_index, Some(2)); // first index of term 2
+
+        // Leader has: [term=1@1, term=3@2, term=3@3, term=3@4]
+        // Leader doesn't have term 2, so should jump to conflict_index=2
+        let mut leader = new_test_core(2, vec![1, 3]);
+        leader.current_term = 3;
+        leader.state = RaftState::Leader;
+        leader.log.push(LogEntry { term: 1, index: 1, command: "CMD 1".to_string() });
+        leader.log.push(LogEntry { term: 3, index: 2, command: "CMD 2".to_string() });
+        leader.log.push(LogEntry { term: 3, index: 3, command: "CMD 3".to_string() });
+        leader.log.push(LogEntry { term: 3, index: 4, command: "CMD 4".to_string() });
+        leader.next_index.insert(1, 5);
+        leader.handle_append_entries_result(1, 4, &output.result);
+        assert_eq!(leader.next_index.get(&1), Some(&2));
+    }
+
+    #[test]
+    fn test_conflict_hint_term_mismatch_leader_has_term() {
+        // When leader also has entries with the conflicting term, it should jump past them
+        let mut follower = new_test_core(1, vec![2, 3]);
+        follower.current_term = 3;
+        // Follower: [term=1@1, term=2@2, term=2@3]
+        follower.log.push(LogEntry { term: 1, index: 1, command: "CMD 1".to_string() });
+        follower.log.push(LogEntry { term: 2, index: 2, command: "CMD 2".to_string() });
+        follower.log.push(LogEntry { term: 2, index: 3, command: "CMD 3".to_string() });
+
+        let args = AppendEntriesArgs {
+            term: 3,
+            leader_id: 2,
+            prev_log_index: 3,
+            prev_log_term: 3,
+            entries: vec![],
+            leader_commit: 0,
+        };
+        let output = follower.handle_append_entries(&args);
+
+        assert!(!output.result.success);
+        assert_eq!(output.result.conflict_term, Some(2));
+        assert_eq!(output.result.conflict_index, Some(2));
+
+        // Leader has: [term=1@1, term=2@2, term=3@3]
+        // Leader has term 2 at index 2, so next_index = 2 + 1 = 3
+        let mut leader = new_test_core(2, vec![1, 3]);
+        leader.current_term = 3;
+        leader.state = RaftState::Leader;
+        leader.log.push(LogEntry { term: 1, index: 1, command: "CMD 1".to_string() });
+        leader.log.push(LogEntry { term: 2, index: 2, command: "CMD 2".to_string() });
+        leader.log.push(LogEntry { term: 3, index: 3, command: "CMD 3".to_string() });
+        leader.next_index.insert(1, 4);
+        leader.handle_append_entries_result(1, 3, &output.result);
+        assert_eq!(leader.next_index.get(&1), Some(&3));
+    }
+
+    #[test]
+    fn test_conflict_hint_empty_log() {
+        // Wiped node with empty log — leader should jump to index 1 immediately
+        let mut follower = new_test_core(1, vec![2, 3]);
+        follower.current_term = 1;
+        // Empty log
+
+        // Leader sends prev_log_index=100 (follower has nothing)
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 100,
+            prev_log_term: 1,
+            entries: vec![],
+            leader_commit: 0,
+        };
+        let output = follower.handle_append_entries(&args);
+
+        assert!(!output.result.success);
+        assert_eq!(output.result.conflict_term, None);
+        assert_eq!(output.result.conflict_index, Some(1)); // last_log_index(0) + 1
+
+        // Leader should jump next_index from 101 to 1 in a single round trip
+        let mut leader = new_test_core(2, vec![1, 3]);
+        leader.current_term = 1;
+        leader.state = RaftState::Leader;
+        leader.next_index.insert(1, 101);
+        leader.handle_append_entries_result(1, 100, &output.result);
+        assert_eq!(leader.next_index.get(&1), Some(&1));
+    }
+
+    #[test]
+    fn test_conflict_hint_gap_log() {
+        // Simulate a "gap log" — entries start at a high index but snapshot_last_index=0.
+        // This happens when the wipe procedure leaves behind a partial log file:
+        // the process writes entries AFTER rm -rf /data/* but before being killed.
+        let mut follower = new_test_core(1, vec![2, 3]);
+        follower.current_term = 1;
+        // Simulate gap: entries start at index 229 (no entries 1-228, no snapshot)
+        follower.log.push(LogEntry { term: 1, index: 229, command: "CMD 229".to_string() });
+        follower.log.push(LogEntry { term: 1, index: 230, command: "CMD 230".to_string() });
+        // snapshot_last_index remains 0
+
+        // last_log_index() reports 230 (from the actual entries)
+        assert_eq!(follower.last_log_index(), 230);
+        // But get_log_entry(229) returns None because offset = 229 - 0 - 1 = 228,
+        // and log only has 2 entries
+        assert!(follower.get_log_entry(229).is_none());
+        assert!(follower.get_log_entry(230).is_none());
+
+        // Leader sends prev_log_index=229 (thinks follower might have it)
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 229,
+            prev_log_term: 1,
+            entries: vec![],
+            leader_commit: 0,
+        };
+        let output = follower.handle_append_entries(&args);
+        assert!(!output.result.success);
+
+        // The conflict hint should point to snapshot_last_index+1 (= 1), not
+        // last_log_index+1 (= 231). The latter would create an infinite loop where
+        // the leader's next_index goes UP instead of down.
+        let ci = output.result.conflict_index.unwrap();
+        assert_eq!(ci, 1, "Gap log should return conflict_index=1 (snapshot_last_index+1)");
+        println!("Gap log conflict_index: {} (last_log_index={})", ci, follower.last_log_index());
+
+        // Now simulate what the leader does with this hint
+        let mut leader = new_test_core(2, vec![1, 3]);
+        leader.current_term = 1;
+        leader.state = RaftState::Leader;
+        for i in 1..=250 {
+            leader.log.push(LogEntry { term: 1, index: i, command: format!("CMD {}", i) });
+        }
+        leader.next_index.insert(1, 230);
+
+        // Simulate multiple heartbeat cycles to see if leader makes progress
+        let mut prev_next = 230u64;
+        for round in 0..5 {
+            let next_idx = leader.next_index.get(&1).copied().unwrap_or(1);
+            let prev_log_index = next_idx - 1;
+
+            // Simulate follower response
+            let args = AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index,
+                prev_log_term: 1,
+                entries: vec![],
+                leader_commit: 0,
+            };
+            let output = follower.handle_append_entries(&args);
+
+            if output.result.success {
+                println!("Round {}: SUCCESS at next_index={}", round, next_idx);
+                break;
+            }
+
+            let last_entry_index = 0; // empty heartbeat
+            leader.handle_append_entries_result(1, last_entry_index, &output.result);
+            let new_next = leader.next_index.get(&1).copied().unwrap_or(1);
+            println!(
+                "Round {}: REJECT, conflict=({:?},{:?}), next_index: {} -> {}",
+                round, output.result.conflict_term, output.result.conflict_index,
+                prev_next, new_next
+            );
+
+            // Check we're making progress (next_index should decrease)
+            assert!(
+                new_next < prev_next,
+                "Leader must make progress: next_index went from {} to {} (stuck!)",
+                prev_next, new_next
+            );
+            prev_next = new_next;
+        }
+    }
+
+    #[test]
+    fn test_full_catch_up_after_wipe() {
+        // End-to-end test: leader has 100 entries, follower has empty log (clean wipe).
+        // Verify the leader can catch up the follower in at most 2 rounds.
+        let mut leader = new_test_core(1, vec![2, 3]);
+        leader.current_term = 1;
+        leader.state = RaftState::Leader;
+        for i in 1..=100 {
+            leader.log.push(LogEntry { term: 1, index: i, command: format!("CMD {}", i) });
+        }
+        leader.commit_index = 100;
+        leader.next_index.insert(2, 101); // Leader thinks peer 2 is caught up
+
+        let mut follower = new_test_core(2, vec![1, 3]);
+        follower.current_term = 1;
+        // Empty log (clean wipe)
+
+        // Round 1: Leader sends empty heartbeat (no entries beyond log end)
+        let next_idx = leader.next_index.get(&2).copied().unwrap();
+        assert_eq!(next_idx, 101);
+        let prev_log_index = next_idx - 1; // 100
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 1,
+            prev_log_index,
+            prev_log_term: 1,
+            entries: vec![], // next_idx > last_log_index, no entries to send
+            leader_commit: 100,
+        };
+        let output = follower.handle_append_entries(&args);
+        assert!(!output.result.success);
+        assert_eq!(output.result.conflict_index, Some(1)); // follower's log is empty
+        leader.handle_append_entries_result(2, 0, &output.result);
+        assert_eq!(leader.next_index.get(&2), Some(&1)); // Leader jumped back to 1
+
+        // Round 2: Leader sends ALL entries from index 1
+        let entries: Vec<_> = leader.log.iter().cloned().collect();
+        let args = AppendEntriesArgs {
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries,
+            leader_commit: 100,
+        };
+        let output = follower.handle_append_entries(&args);
+        assert!(output.result.success);
+        assert_eq!(follower.commit_index, 100);
+        assert_eq!(follower.last_applied, 100);
+        assert_eq!(follower.log.len(), 100);
     }
 }

@@ -7,7 +7,7 @@ An educational implementation of the [Raft consensus protocol](https://raft.gith
 This project is designed for learning both Rust and distributed consensus concepts. It's not production-ready, but implements the core Raft features:
 
 - **Leader Election** - Nodes elect a leader through randomized timeouts
-- **Log Replication** - Leader replicates log entries to followers
+- **Log Replication** - Leader replicates log entries to followers with conflict hint optimization
 - **Log Compaction** - Automatic snapshotting to prevent unbounded log growth
 - **Linearizable Reads** - ReadIndex algorithm for consistent reads
 - **Persistence** - File-based storage for crash recovery
@@ -260,8 +260,13 @@ The chaos tests run a 5-node Raft cluster in Docker containers and inject real f
 | `test_partition_heal` | Partition then heal after 2s | Cluster recovers, linearizable |
 | `test_slow_network` | Add 50ms latency to 2 nodes | Operations slower but linearizable |
 | `test_rolling_restart` | Kill/restart nodes one at a time | Cluster stays available |
+| `test_asymmetric_partition` | One-way network partition | Leader handles asymmetric failures |
+| `test_leader_kill_loop` | Kill 3 successive leaders | Repeated failover, linearizable |
+| `test_majority_crash_and_recover` | Kill 3/5 nodes, then restart all | Quorum loss and recovery |
+| `test_packet_loss` | 20% packet loss on 2 nodes | Retransmission handles drops |
+| `test_storage_wipe` | Kill node, wipe storage, restart | Node catches up from leader via conflict hints |
 
-Failure injection uses real Linux tools: `docker network disconnect/connect` for network partitions, `docker kill/start` for node crashes, and `tc netem` for latency injection.
+Failure injection uses real Linux tools: `docker network disconnect/connect` for network partitions, `docker kill/start` for node crashes, `iptables` for asymmetric partitions, and `tc netem` for latency/packet loss injection.
 
 ## Resources
 

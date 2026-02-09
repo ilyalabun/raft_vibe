@@ -225,6 +225,7 @@ impl<T: Transport> RaftNode<T> {
 
                 // Track the last entry index we're sending (for result handling)
                 let last_entry_index = entries.last().map(|e| e.index).unwrap_or(0);
+                let num_entries = entries.len();
 
                 let args = AppendEntriesArgs {
                     term: core.current_term,
@@ -234,6 +235,13 @@ impl<T: Transport> RaftNode<T> {
                     entries,
                     leader_commit: core.commit_index,
                 };
+                // Log catch-up details for lagging peers
+                if next_idx < core.last_log_index() {
+                    println!(
+                        "[NODE {}] Heartbeat to peer {}: next_idx={}, prev_log_index={}, sending {} entries (log_length={})",
+                        core.id, peer_id, next_idx, prev_log_index, num_entries, core.log.len()
+                    );
+                }
                 requests_to_send.push((peer_id, Request::AppendEntries(args, last_entry_index)));
             }
             requests_to_send

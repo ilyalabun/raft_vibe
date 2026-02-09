@@ -11,10 +11,12 @@ use tokio::process::Command;
 use tokio::time::sleep;
 
 /// Status response from the Raft node's /client/status endpoint
-#[derive(Debug, Deserialize)]
-struct StatusResponse {
-    node_id: u64,
-    state: String,
+#[derive(Debug, Clone, Deserialize)]
+pub struct StatusResponse {
+    pub node_id: u64,
+    pub state: String,
+    pub commit_index: u64,
+    pub last_applied: u64,
 }
 
 /// Manages a Docker Compose-based Raft cluster for chaos testing
@@ -100,6 +102,21 @@ impl DockerCluster {
         format!("127.0.0.1:{}", 9100 + id)
     }
 
+    /// Get the status of a specific node, returns None if unreachable
+    pub async fn get_node_status(&self, id: usize) -> Option<StatusResponse> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("Failed to create HTTP client");
+
+        let url = format!("http://{}/client/status", self.node_api_addr(id));
+        if let Ok(resp) = client.get(&url).send().await {
+            resp.json::<StatusResponse>().await.ok()
+        } else {
+            None
+        }
+    }
+
     /// Wait for a leader to be elected within the given timeout
     pub async fn wait_for_leader(&self, timeout: Duration) -> Option<u64> {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -180,6 +197,43 @@ impl DockerCluster {
         } else {
             println!("Started node {}", id);
         }
+    }
+
+    /// Wipe a node's persistent storage by recreating the container.
+    ///
+    /// Removes the container entirely and recreates it from the compose file,
+    /// guaranteeing a clean filesystem. The old approach (start → exec rm → kill)
+    /// had a race condition where the raft-server could write new entries to /data
+    /// after the rm but before being killed, creating a corrupted "gap log".
+    pub async fn wipe_node_storage(&self, id: usize) {
+        let container = format!("raft-node-{}", id);
+        let service = format!("raft-node-{}", id);
+
+        // Ensure container is stopped
+        let _ = Command::new("docker")
+            .args(["kill", &container])
+            .output()
+            .await;
+
+        // Remove the container (clears its writable filesystem layer)
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &container])
+            .output()
+            .await;
+
+        // Recreate the container from compose (clean filesystem, not started)
+        let output = Command::new("docker")
+            .args(["compose", "-f", &self.compose_file, "create", &service])
+            .output()
+            .await
+            .expect("Failed to recreate container after wipe");
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("docker compose create {} warning: {}", service, stderr);
+        }
+
+        println!("Wiped storage on node {} (container recreated)", id);
     }
 
     /// Kill the current leader
